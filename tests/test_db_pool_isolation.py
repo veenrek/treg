@@ -26,6 +26,7 @@ from treg.infra import db as infra_db
 SRC = pathlib.Path(infra_db.__file__).parent.parent   # src/treg/
 
 API, ADMIN, BACKGROUND = "session_maker", "admin_session_maker", "background_session_maker"
+RATELIMIT = "ratelimit_session_maker"
 
 # Every module that opens a session, and the pool(s) it is allowed to reach for. Modules with two
 # entries genuinely serve two classes of work and each is justified where it is imported.
@@ -69,6 +70,9 @@ EXPECTED_MAKERS: dict[str, set[str]] = {
     "domain/capacity/marks.py": {API}, "domain/capacity/routes_view.py": {API},
     "domain/capacity/view.py": {API},
     "domain/identity/api_keys.py": {BACKGROUND},
+    # The rate limiter's background work (surge-signal flush, eviction restore) has its own pool.
+    "application/ratelimit/background.py": {RATELIMIT},
+    "application/ratelimit/signals_flush.py": {RATELIMIT},
     # `treg-worker` is its own process; it shares the API pool because nothing else is running in it.
     "worker.py": {API},
     # Runs only inside `treg-worker catalog stats`; same reasoning as `worker.py`.

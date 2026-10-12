@@ -53,7 +53,7 @@ async def _publish(version: int, config: RateLimitConfig, *, actor: str, force: 
         return False
     document = encode_document(version, config, written_by=actor)
     try:
-        stored = await kv.store().rl_config_set(document, version, force=force)
+        stored = await kv.store().rl_publish(kv.RL_CONFIG_KEY, document, version, force=force)
     except kv.Unavailable as exc:
         log.error("rate_limit_config_publish_failed version=%s error=%s", version, exc)
         return False
@@ -113,6 +113,17 @@ async def republish(db: AsyncSession, *, actor: str) -> dict:
     await db.commit()
     out["published"] = await _publish(latest.id, config, actor=actor, force=True)
     return out
+
+
+async def restore(db: AsyncSession) -> int | None:
+    """The background repair for an evicted `rl:config`: publish the newest row, never over a newer
+    document. Returns the version published, None when there is nothing to publish."""
+    latest = await _latest(db)
+    await db.commit()
+    if latest is None:
+        return None
+    config = RateLimitConfig.model_validate(latest.config)
+    return latest.id if await _publish(latest.id, config, actor="restore", force=False) else None
 
 
 async def history(db: AsyncSession) -> list[dict]:

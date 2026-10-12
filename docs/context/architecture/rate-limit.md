@@ -1,19 +1,25 @@
 ---
-title: Request rate limiting — layered, measured in shadow before it refuses anything
-status: built; env default mode is shadow, enforce needs an audited admin write
+title: Request admission — blocklist, overload cap, global ceiling, surge signals (batch 1)
+status: built; blocklist log_only, global ceiling shadow, overload cap off by default
 sources:
   - src/treg/domain/ratelimit/__init__.py
   - src/treg/domain/ratelimit/policy.py
   - src/treg/application/ratelimit/__init__.py
   - src/treg/application/ratelimit/limiter.py
   - src/treg/application/ratelimit/config_state.py
+  - src/treg/application/ratelimit/blocklist_state.py
   - src/treg/application/ratelimit/background.py
   - src/treg/application/ratelimit/metrics.py
+  - src/treg/application/ratelimit/signals.py
+  - src/treg/application/ratelimit/signals_flush.py
   - src/treg/application/ratelimit/admin.py
+  - src/treg/application/ratelimit/blocklist_admin.py
+  - src/treg/application/ratelimit/receipts.py
   - src/treg/routers/admin_rate_limit.py
   - src/treg/bootstrap_ratelimit.py
   - src/treg/infra/request_scope.py
   - src/treg/infra/kv.py
+  - src/treg/infra/db.py
   - src/treg/config.py
   - src/treg/domain/identity/access.py
   - src/treg/alembic/versions/0069_rate_limit_config_version.py
@@ -21,116 +27,130 @@ sources:
   - tests/test_rate_limit_config.py
   - tests/test_rate_limit_middleware.py
   - tests/test_rate_limit_admin.py
-  - tests/test_rate_limit_redis.py
+  - tests/test_rate_limit_overload.py
 related:
   - architecture/import-boundaries.md
   - architecture/money.md
   - ops/capacity.md
 ---
 
-# Request rate limiting
+# Request admission
 
-A flood through many valid keys exhausts **in-flight concurrency** before it exhausts request
-rate: long-held requests occupy workers and database connections. treg has no reverse proxy in
-front of it, so the protection lives in the app, as the outermost middleware
-(`bootstrap_ratelimit.RateLimitMiddleware`, added last in `bootstrap.create_app`). It runs before
-auth, any database session and money admission. Every decision is
-`application.ratelimit.limiter.RateLimiter`; the rules are `domain.ratelimit.policy`.
+A flood through many valid keys exhausts **in-flight concurrency** before request rate. treg has
+no reverse proxy, so admission lives in the app, as the outermost middleware
+(`bootstrap_ratelimit.RateLimitMiddleware`, added last in `bootstrap.create_app`), before auth, any
+database session and money admission. Decisions are `application.ratelimit.limiter.RateLimiter`;
+rules are `domain.ratelimit.policy`. Per-key, per-org, tier and IP layers are a later batch.
 
-## Layers
+Order per request:
 
-Evaluated in `policy.LAYERS` order; each has its own `reason` (`policy.REASONS`, `treg_rl.<layer>`)
-so logs and metrics say which layer, ours or any other mitigation's, refused a request.
+1. **Overload cap** (`overload_cap_enabled`, off by default): an in-process `asyncio.Semaphore` of
+   `overload_cap_size`, no shared store. When it is full (`locked()`) the request gets **503**,
+   `Retry-After`, `reason: overload_cap` (`X-Treg-Overload-Reason`), at once; it never queues. The
+   permit is held until the app returns, which for ASGI is after the last streamed chunk, a client
+   disconnect, an exception or a cancellation. Health checks and `/admin/*` are not counted.
+   Distinct from the database pool's `503 treg_saturated`.
+2. **Blocklist by key hash**, before auth (SHA-256 of the presented token, the `ApiKey.key_hash`
+   spelling), and by org id when the key's org is already in the key cache.
+3. **Global concurrency ceiling** (below), last of the middleware's checks.
+4. **Blocklist by org id after auth**: the middleware puts `check_org` in the request's scope slot
+   and `access.require_member` calls it once it knows the org (`_refuse_blocked_org`), so a blocked
+   org is refused even on a key's first request in a process.
 
-1. **Per key** — a token bucket (`key_rate_per_s`, `key_burst`) and a concurrency cap.
-2. **Per org** — the same pair for the whole team, keyed by org slug. `org_overrides` replaces the
-   org layer's figures for one slug, whatever the tier.
-3. **Tier** — `paid` or `unpaid` thresholds. Paid = the team has a `purchased` `CreditBlock` with a
-   Stripe payment intent (`access._org_has_paid`). Account age is the secondary signal (below).
-4. **Per IP** — no volume cap. A HyperLogLog counts distinct known orgs per IP per `ip_window_s`
-   window. Past `ip_distinct_orgs_threshold`, an **unpaid org younger than `new_org_age_s`** behind
-   that IP gets the `tightened` thresholds instead of `unpaid`; nobody else changes. The IP layer
-   also has a concurrency cap.
-5. **Global** — a concurrency ceiling, evaluated **last**: a request another layer refuses never
-   holds a global slot. `global_paid_reserve` slots are usable by paid orgs only (an unpaid org sees
-   `global_concurrency - global_paid_reserve`), so unpaid traffic is shed first.
+Every refusing layer has its own label: `overload_cap`, `treg_blocklist.key_hash`,
+`treg_blocklist.org_id`, `treg_rl.global_concurrency`.
 
-The client IP is the ASGI peer (`scope["client"]`). The middleware never reads a forwarded-for
-header. Whether the peer is the real client or the load balancer's address is a deployment fact
-that shadow data answers (`distinct_ips` in the gauge) before the IP layer may enforce.
+## Blocklist
 
-A key is known only through `KeyCache`, a per-process LRU of key hashes (`request_scope.key_id`,
-the SHA-256 of the token and the `X-Treg-Org` header) with a short TTL. A miss sets `want_caller`
-in the request's scope slot; `access.require_member` then publishes the org, its paid status and
-age into the slot, and `RateLimiter.finish` caches it. So an **unknown or invalid key counts only at
-the IP layer** and never creates a per-key, per-org or global counter. The cost is a cold start after
-each deploy, counted as `unknown_key_requests`.
+Mode `blocklist_mode`: `off`, `log_only` (the default: match, log `rate_limit_blocklist_match`,
+serve), `enforce_403` (refuse with **403**, `X-Treg-Block-Reason`, the entry's reason and the
+blocklist version, so clients do not retry). The env accepts only `off` or `log_only`; `enforce_403`
+is an audited policy write.
 
-Exempt: `rate_limit_exempt_paths` (health, the Stripe webhooks), requests carrying a server-side
-credential (`admin_token`, the house-team tokens), and treg's own in-process requests, which
-`request_scope.internal_app` marks in the ASGI scope (no network client can set a scope key). MCP
-and hub checks reach `/call/` that way: the outer request was already counted, and the inner
-request's auth also teaches the cache the outer token (`alias`).
+**Source of truth:** `BlocklistEntry` (one row per target, `expires_at` always set, `revoked_at` for
+an unblock) and `BlocklistAudit` (one row per call, append-only; its id is the published
+version). Migrations live in this repo only.
 
-## Shared store
+**Distribution:** `rl:blocklist`, one JSON string overwritten whole:
 
-One Lua script per request (`kv._RL_ADMIT`): phase one reads every layer, phase two takes a token
-from each bucket and adds the request to each concurrency set only when every layer allowed it, or
-the mode is not `enforce`. `rl_release` removes it in the middleware's `finally`, whatever the app
-raised. Keys are `rl:`-prefixed. Per-second request counters live two seconds; a bucket lives until
-it would be full again; a concurrency set is a sorted set of request ids scored by start time, and
-entries older than `concurrency_ttl_s` (validated to be at least `call_timeout_s`) are dropped, so a
-release lost to a crash overcounts for at most that long. `rl_memory` samples what `rl:` keys
-occupy next to the store's total, because the store evicts by LRU and also holds money-admission
-leases.
+```json
+{"schema_version": 1, "version": <audit id>, "updated_at": "<ISO 8601 UTC>",
+ "entries": [{"type": "key_hash" | "org_id", "value": "<sha256 hex | org id>",
+              "reason": "<text>", "expires_at": "<ISO 8601 UTC>", "approved_by": "<name>"}]}
+```
 
-**Fail open.** A store fault (`kv.Unavailable`) is counted (`store_errors`), starts a short cooldown
-(`rate_limit_store_cooldown_s`) so an outage does not add a timeout to every request, and the
-decision falls back to `policy.LocalLimiter`: the same plan per process, so looser across
-processes, and without IP tightening. Without `TREG_KV_URL` the limiter always runs locally.
+`policy.parse_blocklist` validates it; readers ignore expired entries. Each process reads it every
+`rate_limit_blocklist_refresh_s` in `background.blocklist_loop` (`blocklist_state.refresh_once`),
+never on the request path. An unreadable store or a missing key keeps the last good list; a payload
+that does not parse or has an unknown `schema_version` keeps it too and alerts
+(`rate_limit_blocklist_invalid`). **Missing is never empty**: before a first good read a process has
+no list, reported as `blocklist_loaded: false`.
 
-## Policy: env defaults, an audited table, a cached copy
+**Writer:** `POST /admin/blocklist` (`blocklist_admin.block`), authorized by
+`blocklist_admin_token`, a credential that opens the blocklist and status endpoints only
+(`require_blocklist_writer`; a super-admin also passes). Guards, each a **400** naming the failure,
+and one bad target refuses the whole call:
 
-- **Env** (`Settings.rate_limit_*`) holds the defaults, validated against the same schema at boot.
-  `rate_limit_mode` accepts only `off` or `shadow`. An unset threshold measures its layer and
-  refuses nothing; no capacity figure is written in code. Enforce figures are derived from shadow
-  data: capacity from measured peak in-flight concurrency, rate from that concurrency over p95
-  latency.
-- **Postgres** `RateLimitConfigVersion` is the source of truth: one audited row per write (actor,
-  action, mode, note, the full document, `enforce_approval`). Only `application.ratelimit.admin`
-  writes it, only through `/admin/rate-limit/config` (`require_superadmin`). Every value is range
-  checked first (`RateLimitConfig`, extra fields forbidden); `enforce` needs `enforce_approval`;
-  `base_version` turns a stale write into a 409. `revert-to-shadow` writes the current thresholds
-  in shadow mode as its own audited row. The row commits **before** the store is written.
-- **`rl:config`** in the shared store is the copy processes read, written after the commit by a
-  compare-and-set that never replaces a newer version (`republish` forces it, the remedy when the
-  store evicted the key or a publish failed).
-- **Processes** read `rl:config` only in `background.run`, every `rate_limit_config_refresh_s`
-  (`config_state.refresh_once`). The request path reads the in-memory `config_state.current()` and
-  never the store or the table (the second import contract). A bad or missing value keeps the last
-  good policy; with none, the env defaults serve and `rate_limit_config_env_fallback` is logged at
-  error level and sent as `ratelimit_config_fallback`, and every gauge carries
-  `config_fallback: true`. Every change of version is logged (`rate_limit_config_changed`).
+- every target resolves to an org (a key hash through `ApiKey` or `Membership.token_hash`; a signed
+  Default key has no stored hash and is blocked through its org);
+- the org has **never paid** (no completed Stripe top-up; treg records no refund amount) and was
+  created inside `blocklist_new_org_max_age_s`;
+- at most `blocklist_max_entries_per_call` targets; every entry expires, `ttl_s` defaults to
+  `blocklist_default_ttl_s` (24 h) and may not exceed `blocklist_max_ttl_s`;
+- reason, approver and non-empty evidence are required.
 
-## Modes and responses
+The call is budgeted (`blocklist_writes_per_hour`, a shared-store window that fails closed, 429).
+Order: entries and the audit row commit, then the whole active list is published to
+`rl:blocklist` by a compare-and-set that never replaces a newer version. A failed publish reports
+`published: false`. After the write the server posts a receipt (entries, TTL, version, audit id) to
+Slack (`receipts`, `blocklist_receipt_slack_token`/`_channel`) in a task: best-effort, counted on
+failure (`blocklist_receipt_failures`), never delaying or undoing the write. `POST
+/admin/blocklist/{id}/unblock` is the one-action unblock. `GET /admin/blocklist/status?version=N` is
+the readback: `live` once the store and every process with a fresh heartbeat (`rl:live:<instance>`)
+serve at least N.
 
-`off` skips the middleware's work entirely. `shadow` never refuses: each layer that would have
-refused logs `rate_limit_would_block` (layer, reason, tier, paid, key-hash prefix, org, IP, value,
-cap, config version). `enforce` answers **429** with `Retry-After` (the bucket's wait, or
-`concurrency_retry_after_s`), `X-Treg-RateLimit-Layer`, `X-Treg-RateLimit-Reason`, and a body
-naming the layer, reason and config version. Lines are bounded per window
-(`rate_limit_log_max_per_window`), except a paid org's, which is never dropped.
+The window, per-call cap and write budget defaults are placeholders, to be set from surge signals.
+
+## Global concurrency ceiling
+
+Mode `off`, `shadow` (default; logs `rate_limit_would_block`) or `enforce` (**429**, `Retry-After`).
+One Lua script (`kv._RL_ADMIT_GLOBAL`) over a sorted set of request ids scored by start time;
+entries older than `concurrency_ttl_s` (at least `call_timeout_s`) age out; the middleware's
+`finally` removes the request. `global_paid_reserve` slots are usable by paid orgs only
+(`RateLimitConfig.global_cap`). A key not yet in the key cache (every key's first request after a
+deploy) is counted but never refused: refused before auth it would never be learned. The figure is
+unset by default; it comes from measured peak in-flight concurrency and p95 latency. A store fault
+fails open to `policy.LocalCeiling` per process, with a short cooldown.
+
+The key cache (`KeyCache`, `request_scope.key_id`) learns a key's org, paid status and age from
+`access.require_member` when the middleware asks (`want_caller`), one indexed read per key per TTL.
+
+## Policy
+
+`RateLimitConfig` (mode, blocklist mode, global figures). **Env** holds defaults (mode `off` or
+`shadow`, blocklist `off` or `log_only`). **Postgres** `RateLimitConfigVersion` is the audited
+source (`PUT /admin/rate-limit/config`, super-admin; range checked; `enforce` needs
+`enforce_approval`; `revert-to-shadow` is one audited action). **`rl:config`** is the copy processes
+read every `rate_limit_config_refresh_s` in the background. A bad, missing or unreadable value
+keeps the last good policy for at most `rate_limit_config_max_age_s`; past that `enforce` is served
+as `shadow` and `rate_limit_config_stale` alerts. With nothing good, env defaults serve and
+`rate_limit_config_env_fallback` alerts. Every version change is logged.
+
+**Eviction repair:** the store evicts by LRU. When either key is missing, `background.maybe_restore`
+republishes it from Postgres on the dedicated `ratelimit` pool, at most once per
+`rate_limit_republish_interval_s` across processes (a store claim). The request path never reads
+Postgres (import contract).
+
+## Surge signals
+
+Record-only. `signals` aggregates in process memory per IP, per org and per (IP, org): requests,
+call requests, unknown keys, 401/403/429/5xx, blocklist matches, distinct orgs and keys, peak in
+flight; bounded by `surge_max_subjects`. `signals_flush` writes one `SurgeSignal` row per subject
+per `surge_flush_s` on the `ratelimit` pool, with the org's `created_at` and paid total, and prunes
+past `surge_retention_days`. The client IP is the ASGI peer; a forwarded-for header is never read.
 
 ## Telemetry
 
-Drained once per `rate_limit_metrics_emit_s` by the background task (`background.emit`), as
-analytics events and log lines:
-
-- `ratelimit_decision` — counts by layer, reason, result (`allow`, `shadow_reject`, `reject`),
-  tier (`paid`, `unpaid`, `tightened`, `unknown`), paid and config version. A paid row with a
-  `reject` or `shadow_reject` result is also logged at warning level: the hook for "a paid org was
-  refused" alerting.
-- `ratelimit_gauge` — p50/p95/p99/max of each key's, org's and IP's peak rate and concurrency in
-  the window, distinct orgs per IP, global concurrency, store latency, store and release errors,
-  local decisions, unknown-key requests, exempt requests, key-cache size, `rl:` memory sample, and
-  the config version, source and fallback flag.
+`ratelimit_decision` rows by layer, reason, result, tier, paid, config version and mode;
+`ratelimit_gauge` per process with its config and blocklist versions and modes, peak global
+concurrency, store latency, `rl:` memory sample and the counters above.

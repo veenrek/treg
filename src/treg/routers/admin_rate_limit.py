@@ -1,14 +1,23 @@
-"""Super-admin control of the request rate-limit policy (docs/context/architecture/rate-limit.md)."""
+"""Admin control of request admission: the policy, the blocklist, and what each process serves.
+
+Config writes need a super-admin. Blocklist writes also accept `blocklist_admin_token`, a credential
+that opens these endpoints and nothing else (docs/context/architecture/rate-limit.md).
+"""
 
 from __future__ import annotations
+
+import json
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..application.ratelimit import admin as rl_admin
-from ..application.ratelimit import config_state
-from ..domain.identity.access import require_superadmin
+from ..application.ratelimit import background, blocklist_admin, config_state
+from ..config import get_settings
+from ..domain.identity.access import require_blocklist_writer, require_superadmin
+from ..infra import kv
 from ..infra.db import get_admin_session
 
 router = APIRouter()
@@ -26,10 +35,38 @@ class RevertIn(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
-def _process_view() -> dict:
-    state = config_state.current()
-    return {"version": state.version, "source": state.source, "fallback": state.fallback,
-            "mode": state.config.mode}
+class BlockTarget(BaseModel):
+    type: str
+    value: str
+
+
+class BlockIn(BaseModel):
+    entries: list[BlockTarget]
+    reason: str
+    approved_by: str
+    evidence: dict
+    ttl_s: int | None = None
+
+
+class UnblockIn(BaseModel):
+    approved_by: str
+    reason: str
+
+
+async def _live() -> list[dict]:
+    if not kv.configured():
+        return [background.process_status()]
+    try:
+        rows = await kv.store().rl_live()
+    except kv.Unavailable:
+        return []
+    out = []
+    for raw in rows:
+        try:
+            out.append(json.loads(raw))
+        except ValueError:
+            continue
+    return sorted(out, key=lambda r: r.get("process_instance", ""))
 
 
 @router.get("/admin/rate-limit/config", include_in_schema=False)
@@ -37,7 +74,8 @@ async def admin_rate_limit_config(
     _: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
     rows = await rl_admin.history(db)
-    return {"current": rows[0] if rows else None, "history": rows, "this_process": _process_view()}
+    return {"current": rows[0] if rows else None, "history": rows,
+            "this_process": background.process_status()}
 
 
 @router.put("/admin/rate-limit/config", include_in_schema=False)
@@ -72,3 +110,70 @@ async def admin_rate_limit_republish(
         return await rl_admin.republish(db, actor=principal)
     except rl_admin.NothingToPublish:
         raise HTTPException(status_code=404, detail="no rate-limit config has been written")
+
+
+@router.get("/admin/rate-limit/status", include_in_schema=False)
+async def admin_rate_limit_status(_: str = Depends(require_blocklist_writer)) -> dict:
+    """Every serving process's config and blocklist version and mode, from its heartbeat."""
+    return {"this_process": background.process_status(), "processes": await _live()}
+
+
+@router.get("/admin/blocklist", include_in_schema=False)
+async def admin_blocklist(
+    _: str = Depends(require_blocklist_writer), db: AsyncSession = Depends(get_admin_session),
+) -> dict:
+    return await blocklist_admin.listing(db)
+
+
+@router.get("/admin/blocklist/status", include_in_schema=False)
+async def admin_blocklist_status(
+    version: int | None = None, _: str = Depends(require_blocklist_writer),
+    db: AsyncSession = Depends(get_admin_session),
+) -> dict:
+    """The readback an operator tool polls after a write: `live` is true once the store and every
+    process with a fresh heartbeat serve at least `version`."""
+    pg_version = (await blocklist_admin.listing(db))["version"]
+    store_version = await blocklist_admin.store_version()
+    processes = await _live()
+    want = pg_version if version is None else version
+    serving = [p.get("blocklist_version") or 0 for p in processes]
+    return {
+        "pg_version": pg_version, "store_version": store_version,
+        "processes": [{k: p.get(k) for k in ("process_instance", "blocklist_version", "blocklist_entries",
+                                              "blocklist_loaded", "blocklist_mode")} for p in processes],
+        "live": bool(serving) and (store_version or 0) >= want and min(serving) >= want,
+    }
+
+
+@router.post("/admin/blocklist", include_in_schema=False)
+async def admin_blocklist_block(
+    body: BlockIn, principal: str = Depends(require_blocklist_writer),
+    db: AsyncSession = Depends(get_admin_session),
+) -> dict:
+    """Block unpaid, new orgs or their keys, with a TTL. 400 names every guard a call failed."""
+    # A fixed hourly window in the shared store; an unanswerable store refuses (fails closed).
+    window = int(time.time() // 3600)
+    if not await kv.store().take(f"rl:blocklist-writes:{window}", get_settings().blocklist_writes_per_hour, 3600):
+        raise HTTPException(status_code=429, detail={"error": "blocklist_write_budget",
+                                                     "message": "too many blocklist writes this hour"},
+                            headers={"Retry-After": str(3600 - int(time.time()) % 3600)})
+    try:
+        return await blocklist_admin.block(
+            db, actor=principal, entries=[t.model_dump() for t in body.entries], reason=body.reason,
+            approved_by=body.approved_by, evidence=body.evidence, ttl_s=body.ttl_s)
+    except blocklist_admin.Rejected as exc:
+        raise HTTPException(status_code=400, detail={"error": "rejected", "errors": exc.errors})
+
+
+@router.post("/admin/blocklist/{entry_id}/unblock", include_in_schema=False)
+async def admin_blocklist_unblock(
+    entry_id: int, body: UnblockIn, principal: str = Depends(require_blocklist_writer),
+    db: AsyncSession = Depends(get_admin_session),
+) -> dict:
+    try:
+        return await blocklist_admin.unblock(db, entry_id, actor=principal,
+                                             approved_by=body.approved_by, reason=body.reason)
+    except blocklist_admin.Rejected as exc:
+        raise HTTPException(status_code=400, detail={"error": "rejected", "errors": exc.errors})
+    except blocklist_admin.UnknownEntry:
+        raise HTTPException(status_code=404, detail="no such blocklist entry")

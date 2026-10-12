@@ -2080,3 +2080,65 @@ class RateLimitConfigVersion(SQLModel, table=True):
     note: str = ""
     enforce_approval: str | None = None  # who approved refusing requests; required for enforce
     previous_version: int | None = None
+
+
+class BlocklistEntry(SQLModel, table=True):
+    """One blocked API key (by its SHA-256, the `ApiKey.key_hash` spelling) or org (by id).
+
+    The source of truth for `rl:blocklist`. Written only by `application/ratelimit/blocklist_admin.py`
+    through `/admin/blocklist`, each write with a `BlocklistAudit` row, then published. An entry is
+    active until `expires_at` or `revoked_at`; there is no delete."""
+    id: int | None = Field(default=None, primary_key=True)
+    kind: str = Field(index=True)            # key_hash | org_id (the payload's `type`)
+    value: str = Field(index=True)           # sha256 hex | decimal org id
+    reason: str                              # shown to the refused caller
+    approved_by: str                         # the human who approved the block
+    evidence: dict = Field(sa_column=Column(JSON, nullable=False))
+    created_by: str                          # the admin principal that wrote it
+    created_at: NaiveUTC = Field(default_factory=_now)
+    expires_at: NaiveUTC = Field(index=True)
+    revoked_at: NaiveUTC | None = None
+    revoked_by: str | None = None
+    revoke_reason: str | None = None
+
+
+class BlocklistAudit(SQLModel, table=True):
+    """One row per blocklist call (block or unblock), append-only. Its id is the published version."""
+    id: int | None = Field(default=None, primary_key=True)
+    entry_ids: list = Field(sa_column=Column(JSON, nullable=False))
+    action: str                              # block | unblock
+    actor: str                               # the authenticated principal (e.g. the bot token)
+    approved_by: str                         # the human who confirmed
+    reason: str
+    evidence: dict = Field(sa_column=Column(JSON, nullable=False))
+    ttl_s: int | None = None                 # block only
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class SurgeSignal(SQLModel, table=True):
+    """One process's request counts for one subject in one minute. Record-only: nothing refuses a
+    request because of a row here. Written by `application/ratelimit/signals.py` on its own pool.
+
+    `scope` is `ip`, `org` or `ip_org` (one IP's traffic for one org). Org columns are filled at
+    flush time; `net_paid_micro` is the sum of completed Stripe top-ups (`purchased` credit blocks),
+    since treg records no refund or chargeback amount."""
+    id: int | None = Field(default=None, primary_key=True)
+    window_start: NaiveUTC = Field(index=True)
+    process_instance: str
+    scope: str
+    ip: str | None = Field(default=None, index=True)
+    org_id: int | None = Field(default=None, index=True)
+    org_slug: str | None = None
+    org_created_at: NaiveUTC | None = None
+    net_paid_micro: int | None = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    requests: int = 0
+    call_requests: int = 0                   # /call/, /catalog/call/, /table/ and /mcp
+    unknown_key_requests: int = 0
+    status_401: int = 0
+    status_403: int = 0
+    status_429: int = 0
+    status_5xx: int = 0
+    blocklist_matches: int = 0
+    distinct_orgs: int = 0
+    distinct_keys: int = 0
+    max_in_flight: int = 0

@@ -1,0 +1,198 @@
+"""The per-process overload cap: an in-process semaphore in the outermost middleware."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+
+import pytest
+
+from treg.application.ratelimit import blocklist_state, limiter, metrics
+from treg.bootstrap_ratelimit import RateLimitMiddleware
+from treg.config import get_settings
+from treg.domain.ratelimit import parse_blocklist
+from treg.infra import kv
+from tests.fake_rate_limit_store import install
+
+
+@pytest.fixture(autouse=True)
+def _cap(monkeypatch):
+    monkeypatch.setenv("TREG_OVERLOAD_CAP_ENABLED", "true")
+    monkeypatch.setenv("TREG_OVERLOAD_CAP_SIZE", "2")
+    monkeypatch.setenv("TREG_OVERLOAD_CAP_RETRY_AFTER_S", "3")
+    get_settings.cache_clear()
+    limiter.reset_for_tests()
+    yield
+    limiter.reset_for_tests()
+    get_settings.cache_clear()
+
+
+def _scope(path: str = "/call/x") -> dict:
+    return {"type": "http", "path": path, "headers": [], "client": ("127.0.0.1", 1)}
+
+
+class Gate:
+    """An app that answers only when released, streaming two chunks."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.entered = 0
+
+    async def __call__(self, scope, receive, send):
+        self.entered += 1
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"a", "more_body": True})
+        await self.release.wait()
+        await send({"type": "http.response.body", "body": b"b"})
+
+
+async def _call(mw, path="/call/x"):
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    await mw(_scope(path), receive, send)
+    return sent
+
+
+def _status(sent) -> int:
+    return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+
+async def test_off_by_default(monkeypatch):
+    monkeypatch.delenv("TREG_OVERLOAD_CAP_ENABLED")
+    get_settings.cache_clear()
+    assert get_settings().overload_cap_enabled is False
+
+
+async def test_a_full_cap_refuses_at_once_with_503_overload_cap():
+    gate = Gate()
+    mw = RateLimitMiddleware(gate)
+    held = [asyncio.create_task(_call(mw)) for _ in range(2)]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    metrics.drain()
+    sent = await asyncio.wait_for(_call(mw), timeout=1)  # never waits for a permit
+    assert _status(sent) == 503
+    headers = dict(sent[0]["headers"])
+    assert headers[b"retry-after"] == b"3" and headers[b"x-treg-overload-reason"] == b"overload_cap"
+    assert json.loads(sent[1]["body"])["detail"]["reason"] == "overload_cap"
+    assert gate.entered == 2
+    _, gauge = metrics.drain()
+    assert gauge["overload_rejects"] == 1
+    gate.release.set()
+    await asyncio.gather(*held)
+    assert _status(await _call(mw)) == 200
+
+
+async def test_a_stream_holds_its_permit_until_the_last_chunk():
+    gate = Gate()
+    mw = RateLimitMiddleware(gate)
+    streams = [asyncio.create_task(_call(mw)) for _ in range(2)]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    # Both handlers have started their responses, but the streams are still open.
+    assert mw._overload.locked()
+    gate.release.set()
+    await asyncio.gather(*streams)
+    assert not mw._overload.locked() and mw._overload._value == 2
+
+
+async def test_a_client_disconnect_mid_stream_releases_the_permit():
+    async def disconnected(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise OSError("client went away")  # what a server raises when the socket is gone
+
+    mw = RateLimitMiddleware(disconnected)
+    for _ in range(4):
+        with pytest.raises(OSError):
+            await _call(mw)
+    assert mw._overload._value == 2
+
+
+async def test_no_permit_leaks_on_exceptions():
+    async def boom(scope, receive, send):
+        raise RuntimeError("handler failed")
+
+    mw = RateLimitMiddleware(boom)
+    for _ in range(5):
+        with pytest.raises(RuntimeError):
+            await _call(mw)
+    assert mw._overload._value == 2
+
+
+async def test_no_permit_leaks_on_cancellation():
+    gate = Gate()
+    mw = RateLimitMiddleware(gate)
+    tasks = [asyncio.create_task(_call(mw)) for _ in range(2)]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert mw._overload.locked()
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert mw._overload._value == 2
+
+
+@pytest.mark.parametrize("path", ["/health", "/admin/blocklist", "/admin/rate-limit/status", "/admin"])
+async def test_health_and_admin_are_never_counted(path):
+    gate = Gate()
+    mw = RateLimitMiddleware(gate)
+    held = [asyncio.create_task(_call(mw)) for _ in range(2)]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    async def ok(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw.app = ok
+    assert _status(await _call(mw, path)) == 200
+    mw.app = gate
+    gate.release.set()
+    await asyncio.gather(*held)
+
+
+# ---- the blocklist cache: read failures never empty it; nothing matches by accident ----------------
+async def test_a_blocklist_read_failure_keeps_the_last_good_cache(monkeypatch):
+    store = install(monkeypatch)
+    store.docs[kv.RL_BLOCKLIST_KEY] = json.dumps({
+        "schema_version": 1, "version": 3, "updated_at": "2026-10-12T00:00:00Z",
+        "entries": [{"type": "org_id", "value": "7", "reason": "r", "approved_by": "o",
+                     "expires_at": "2099-01-01T00:00:00Z"}]})
+    good = await blocklist_state.refresh_once()
+    store.down = True
+    for _ in range(3):
+        assert await blocklist_state.refresh_once() is good
+    store.down = False
+    for bad in ("", "null", "{}", json.dumps({"schema_version": 1, "version": 4, "entries": None})):
+        store.docs[kv.RL_BLOCKLIST_KEY] = bad
+        assert await blocklist_state.refresh_once() is good
+    assert blocklist_state.current().active(now=0) == 1
+
+
+def _list(*entries):
+    return parse_blocklist(json.dumps({
+        "schema_version": 1, "version": 1, "updated_at": "2026-10-12T00:00:00Z",
+        "entries": [{"type": k, "value": v, "reason": "r", "approved_by": "o",
+                     "expires_at": "2099-01-01T00:00:00Z"} for k, v in entries]}))
+
+
+def test_a_null_org_id_never_matches():
+    bl = _list(("org_id", "7"))
+    for value in (None, "", "None", "null", "0", "7 ", "07"):
+        assert bl.match("org_id", value, now=0) is None
+    rl = limiter.limiter()
+    assert rl._match("org_id", None) is None and rl._match("org_id", "") is None
+
+
+def test_a_hash_mismatch_never_matches():
+    key = "ab" * 32
+    bl = _list(("key_hash", key))
+    assert bl.match("key_hash", key, now=0) is not None
+    for value in (key.upper(), key[:-1] + "0", key[:63], "", None):
+        assert bl.match("key_hash", value, now=0) is None
+    assert bl.match("org_id", key, now=0) is None  # a hash is never compared as an org id

@@ -61,12 +61,15 @@ BACKGROUND_CONSUMERS: dict[str, int] = {
     "api_keys last used": 1,      # throttled best-effort managed-key display metadata
 }
 
-_PRIMARY_POOL_NAMES = ("api", "admin", "background")
+_PRIMARY_POOL_NAMES = ("api", "admin", "background", "ratelimit")
 POOL_SPECS: dict[str, dict[str, int]] = {
     "api":        {"pool_size": 5, "max_overflow": 10},
     "admin":      {"pool_size": 3, "max_overflow": 0},
     "background": {"pool_size": sum(BACKGROUND_CONSUMERS.values()), "max_overflow": 0},
     "read":       {"pool_size": 2, "max_overflow": 0},  # optional replica, a separate DB budget
+    # The rate limiter's background work, one task at a time: the surge-signal flush and the
+    # republish of an evicted `rl:config` / `rl:blocklist`. Never the request pool.
+    "ratelimit":  {"pool_size": 1, "max_overflow": 0},
 }
 
 # A pool of 0 or a negative overflow means UNLIMITED to SQLAlchemy, not "off" — `pool_size=0`
@@ -127,11 +130,13 @@ def connection_budget(workers: int | None = None) -> dict[str, int]:
 
 _budget = connection_budget()
 logging.getLogger("treg").info(
-    "db pools per process: api %d+%d, admin %d+%d, background %d+%d = %d; x%d workers = %d per "
+    "db pools per process: api %d+%d, admin %d+%d, background %d+%d, ratelimit %d+%d = %d; x%d "
+    "workers = %d per "
     "instance, %d at a rolling deploy; compare with the deployment database connection ceiling",
     POOL_SPECS["api"]["pool_size"], POOL_SPECS["api"]["max_overflow"],
     POOL_SPECS["admin"]["pool_size"], POOL_SPECS["admin"]["max_overflow"],
     POOL_SPECS["background"]["pool_size"], POOL_SPECS["background"]["max_overflow"],
+    POOL_SPECS["ratelimit"]["pool_size"], POOL_SPECS["ratelimit"]["max_overflow"],
     _budget["per_process"], _budget["workers"], _budget["per_instance"], _budget["deploy_peak"])
 
 
@@ -174,13 +179,14 @@ def _new_engine(name: str, url: str | None = None):
 _engine = _new_engine("api")
 _admin_engine = _new_engine("admin")
 _background_engine = _new_engine("background")
+_ratelimit_engine = _new_engine("ratelimit")
 
 if _is_sqlite:
     # No pool to protect, and file-level write locks it cannot share: three engines against one file
     # would only manufacture "database is locked". Tests pin the routing, not the isolation.
-    _admin_engine = _background_engine = _engine
+    _admin_engine = _background_engine = _ratelimit_engine = _engine
 
-_engines = (_engine, _admin_engine, _background_engine)
+_engines = (_engine, _admin_engine, _background_engine, _ratelimit_engine)
 _POOL_NAMES = _PRIMARY_POOL_NAMES
 _read_engine = _new_engine("read", _read_db_url) if _read_db_url else _engine
 if _read_db_url:
@@ -224,6 +230,9 @@ admin_session_maker = async_sessionmaker(_admin_engine, class_=AsyncSession, exp
 # The background pool: writers that run off the request path and that no caller is awaiting.
 background_session_maker = async_sessionmaker(
     _background_engine, class_=AsyncSession, expire_on_commit=False)
+# The rate limiter's background pool (POOL_SPECS["ratelimit"]).
+ratelimit_session_maker = async_sessionmaker(
+    _ratelimit_engine, class_=AsyncSession, expire_on_commit=False)
 # Explicitly opted-in reads only. An unset replica aliases the existing maker; a configured
 # replica failing to connect/query raises normally and must never silently load the primary.
 read_session_maker = (async_sessionmaker(_read_engine, class_=AsyncSession, expire_on_commit=False)

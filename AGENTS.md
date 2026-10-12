@@ -99,7 +99,7 @@ agents then built against a constitution that was wrong.
 |---|---|---|
 | `routers/` | HTTP and MCP translation in, response shape out | business rules, query orchestration, money |
 | `application/` | use-case sequencing, transaction boundaries, compensation, cross-domain composition | empty wrappers around one-domain CRUD |
-| `domain/` | rules explainable and testable alone: `identity`, `governance`, `connections`, `tools`, `catalog`, `capacity`, `money`, `asynctasks`, `feedback`, `hub` (a maker's tool made of tools: the manifest, the reference language, the graph), `ratelimit` (request limits: the policy schema and the layer plan) | routers, application, concrete SDKs |
+| `domain/` | rules explainable and testable alone: `identity`, `governance`, `connections`, `tools`, `catalog`, `capacity`, `money`, `asynctasks`, `feedback`, `hub` (a maker's tool made of tools: the manifest, the reference language, the graph), `ratelimit` (request admission: the policy schema, the global ceiling, the blocklist contract) | routers, application, concrete SDKs |
 | `infra/` | DB engine and sessions, crypto, upstream relay and SSRF, ratestore, the shared key-value store, email, Stripe | decisions |
 
 - Domains do not import each other, with three sanctioned edges: `governance -> identity`,
@@ -122,12 +122,13 @@ agents then built against a constitution that was wrong.
   the auto-top-up fields; the call runtime may persist an OAuth token refresh into `secret`; audit
   writes `callrecord`, domains only read it (`application/evidence_retention.py` also updates it,
   blanking the two evidence columns past retention).
-- **Request rate limiting** is the outermost middleware (`bootstrap_ratelimit.py`), before auth, any
-  session and money admission; it fails open when the shared store cannot answer. Its policy is
-  written only by `application/ratelimit/admin.py` (the audited `RateLimitConfigVersion` table, then
-  the store's `rl:config`); serving processes read `rl:config` in a background task, never the table.
-  The env mode is `off` or `shadow`; refusing requests needs an audited admin write.
-  See `docs/context/architecture/rate-limit.md`.
+- **Request admission** is the outermost middleware (`bootstrap_ratelimit.py`), before auth, any
+  session and money admission: an in-process overload cap (off by default), the blocklist (by key
+  hash before auth, by org after; `log_only` by default) and a global concurrency ceiling (`shadow`
+  by default) that fails open when the shared store cannot answer. Its policy and blocklist are
+  written only by `application/ratelimit/admin.py` and `blocklist_admin.py` (audited tables, then
+  `rl:config` / `rl:blocklist`); the request path reads memory only. The env cannot refuse
+  requests; that needs an audited admin write. See `docs/context/architecture/rate-limit.md`.
 - **Feedback handling.** This repo owns `FeedbackHandling` and `FeedbackHandlingEvent` models and
   migrations; the private admin service is their only runtime writer. Original reports remain
   owned by the feedback domain. See `docs/context/architecture/feedback.md`.

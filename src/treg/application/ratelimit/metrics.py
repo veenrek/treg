@@ -1,9 +1,10 @@
 """Bounded in-process rate-limit telemetry, drained once per window by the background task.
 
 Two shapes, both fixed-cardinality: `ratelimit_decision` rows counted by
-(layer, reason, result, tier, paid, config_version), and one `ratelimit_gauge` with p50/p95/p99/max
-of each subject's peak rate and concurrency in the window. Subject identities (key hash, org, IP)
-appear only in the rate-limited `would_block`/`reject` log lines, never in a metric.
+(layer, reason, result, tier, paid, config_version, mode), and one `ratelimit_gauge` per process
+with the window's peak global concurrency, store latency, counters, and the process's config and
+blocklist versions and modes. Subject identities (key hash, org, IP) appear only in the rate-limited
+decision log lines, never in a metric.
 """
 
 from __future__ import annotations
@@ -16,8 +17,6 @@ from collections import Counter
 
 log = logging.getLogger("treg.ratelimit")
 
-SCOPES = {"key_rate": "key", "key_concurrency": "key", "org_rate": "org",
-          "org_concurrency": "org", "ip_concurrency": "ip", "global_concurrency": "global"}
 _MAX_SUBJECTS = 5_000
 _MAX_LATENCIES = 4_096
 _lock = threading.Lock()
@@ -39,9 +38,10 @@ class _Window:
 _w = _Window()
 
 
-def decision(*, layer: str, reason: str, result: str, tier: str, paid: bool, version: int) -> None:
+def decision(*, layer: str, reason: str, result: str, tier: str, paid: bool, version: int,
+             mode: str) -> None:
     with _lock:
-        _w.decisions[(layer, reason, result, tier, paid, version)] += 1
+        _w.decisions[(layer, reason, result, tier, paid, version, mode)] += 1
 
 
 def count(name: str, n: int = 1) -> None:
@@ -55,9 +55,9 @@ def latency(ms: float) -> None:
             _w.latencies_ms.append(ms)
 
 
-def peak(layer: str, metric: str, subject: str, value: int) -> None:
+def peak(scope: str, metric: str, subject: str, value: int) -> None:
     with _lock:
-        table = _w.peaks.setdefault((SCOPES[layer], metric), {})
+        table = _w.peaks.setdefault((scope, metric), {})
         if subject in table:
             table[subject] = max(table[subject], value)
         elif len(table) < _MAX_SUBJECTS:
@@ -95,8 +95,8 @@ def drain() -> tuple[list[dict], dict]:
     with _lock:
         w, _w = _w, _Window()
     rows = [{"layer": layer, "reason": reason, "result": result, "tier": tier, "paid": paid,
-             "config_version": version, "count": n}
-            for (layer, reason, result, tier, paid, version), n in sorted(w.decisions.items(), key=str)]
+             "config_version": version, "mode": mode, "count": n}
+            for (layer, reason, result, tier, paid, version, mode), n in sorted(w.decisions.items(), key=str)]
     gauge: dict = {"subjects_dropped": w.subjects_dropped, "log_lines": w.logs,
                    "log_lines_dropped": w.logs_dropped, "distinct_ips": len(w.distinct_ips),
                    **dict(w.counts)}

@@ -2588,6 +2588,49 @@
       "GET",
       "HEAD"
     ],
+    "name": "admin_rate_limit_status",
+    "path": "/admin/rate-limit/status"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "admin_blocklist",
+    "path": "/admin/blocklist"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
+    "name": "admin_blocklist_status",
+    "path": "/admin/blocklist/status"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "admin_blocklist_block",
+    "path": "/admin/blocklist"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "POST"
+    ],
+    "name": "admin_blocklist_unblock",
+    "path": "/admin/blocklist/{entry_id}/unblock"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
+      "GET",
+      "HEAD"
+    ],
     "name": "catalog_endpoint_access",
     "path": "/catalog/endpoints/{endpoint_id}/access"
   },

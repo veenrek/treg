@@ -1,0 +1,391 @@
+"""The admission middleware in front of the real app: the blocklist, the global ceiling, signals.
+
+Each test sets the policy the way the background refresh would (`config_state._swap`) and the
+blocklist the way its sync would (`blocklist_state.refresh_once` from a fake store), so the request
+path is exercised exactly as served: it reads only memory.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+from sqlmodel import select
+
+from treg import analytics, crypto
+from treg.api import app
+from treg.application.ratelimit import (
+    background,
+    blocklist_state,
+    config_state,
+    limiter,
+    metrics,
+    signals,
+    signals_flush,
+)
+from treg.application.ratelimit.limiter import RequestFacts
+from treg.bootstrap_ratelimit import RateLimitMiddleware
+from treg.config import get_settings
+from treg.domain.ratelimit import Caller, RateLimitConfig
+from treg.infra import kv, request_scope
+from treg.infra.db import session_maker
+from treg.models import CreditBlock, SurgeSignal
+from tests.fake_rate_limit_store import install
+
+PEER = "127.0.0.1"  # what httpx's ASGITransport reports as the client
+VERSION = 42
+
+
+@pytest.fixture(autouse=True)
+def _fresh():
+    get_settings.cache_clear()
+    limiter.reset_for_tests()
+    background.reset_for_tests()
+    yield
+    limiter.reset_for_tests()
+    background.reset_for_tests()
+    get_settings.cache_clear()
+
+
+def use(**update) -> RateLimitConfig:
+    doc = get_settings().rate_limit_defaults.model_dump(mode="json")
+    doc.update(update)
+    cfg = RateLimitConfig.model_validate(doc)
+    config_state._swap(config_state.ConfigState(cfg, VERSION, "store", False))
+    metrics.drain()  # the fixture's own signup requests are not part of the test
+    signals.reset_for_tests()
+    return cfg
+
+
+def _iso(delta_s: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=delta_s)).isoformat()
+
+
+def _blocklist(*entries, version: int = 5) -> str:
+    return json.dumps({"schema_version": 1, "version": version, "updated_at": _iso(0), "entries": [
+        {"type": kind, "value": value, "reason": "flood from one IP", "approved_by": "ops",
+         "expires_at": _iso(expires_in)} for kind, value, expires_in in entries]})
+
+
+async def _load_blocklist(monkeypatch, *entries, version: int = 5):
+    store = install(monkeypatch)
+    store.docs[kv.RL_BLOCKLIST_KEY] = _blocklist(*entries, version=version)
+    assert (await blocklist_state.refresh_once()).version == version
+    return store
+
+
+def _token(client) -> str:
+    return client.headers["X-Treg-Token"]
+
+
+async def _learn(client) -> Caller:
+    """The first request of a key teaches the cache who it is."""
+    assert (await client.get("/tools")).status_code == 200
+    caller = limiter.limiter().cache.get(request_scope.key_id(_token(client)), now=limiter.limiter()._clock())
+    assert caller is not None
+    return caller
+
+
+async def _make_paid(org_id: int) -> None:
+    async with session_maker() as db:
+        db.add(CreditBlock(id=uuid.uuid4().hex, org_id=org_id, kind="purchased", amount_micro=10_000_000,
+                           remaining_micro=10_000_000, stripe_payment_intent=f"pi_{uuid.uuid4().hex}"))
+        await db.commit()
+
+
+def _forget_keys() -> None:
+    rl = limiter.limiter()
+    rl.cache = type(rl.cache)(ttl_s=60, max_size=100)
+
+
+def _lines(caplog, name: str) -> list[dict]:
+    return [json.loads(r.getMessage().split(" ", 1)[1]) for r in caplog.records
+            if r.getMessage().startswith(name + " ")]
+
+
+# ---- the blocklist ------------------------------------------------------------------------------
+async def test_a_blocked_key_hash_is_refused_403_before_auth(clients, monkeypatch):
+    use(blocklist_mode="enforce_403")
+    await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token(_token(clients)), 3600))
+    r = await clients.get("/tools")
+    assert r.status_code == 403
+    assert r.headers["x-treg-block-reason"] == "treg_blocklist.key_hash"
+    assert r.json()["detail"] == {"error": "blocked", "reason": "treg_blocklist.key_hash",
+                                  "message": "flood from one IP", "blocklist_version": 5}
+    assert limiter.limiter().cache.get(request_scope.key_id(_token(clients)), now=1e12) is None
+
+
+async def test_a_blocked_org_is_refused_after_auth_even_on_a_keys_first_request(clients, monkeypatch):
+    use(blocklist_mode="enforce_403")
+    caller = await _learn(clients)
+    _forget_keys()  # a cold process: the org is only known once auth resolves it
+    await _load_blocklist(monkeypatch, ("org_id", str(caller.org_id), 3600))
+    r = await clients.get("/tools")
+    assert r.status_code == 403
+    assert r.json()["detail"]["reason"] == "treg_blocklist.org_id"
+    assert r.headers["x-treg-block-reason"] == "treg_blocklist.org_id"
+
+
+async def test_a_cached_org_is_refused_before_auth(clients, monkeypatch):
+    use(blocklist_mode="enforce_403")
+    caller = await _learn(clients)
+    await _load_blocklist(monkeypatch, ("org_id", str(caller.org_id), 3600))
+    r = await clients.get("/tools")
+    assert r.status_code == 403 and r.json()["detail"]["reason"] == "treg_blocklist.org_id"
+
+
+async def test_log_only_matches_and_logs_but_serves(clients, monkeypatch, caplog):
+    use()  # the env default: log_only
+    assert config_state.current().config.blocklist_mode == "log_only"
+    caller = await _learn(clients)
+    await _load_blocklist(monkeypatch, ("org_id", str(caller.org_id), 3600))
+    caplog.set_level(logging.INFO, logger="treg.ratelimit")
+    assert (await clients.get("/tools")).status_code == 200
+    line = _lines(caplog, "rate_limit_blocklist_match")[-1]
+    assert (line["match"], line["mode"], line["enforced"], line["blocklist_version"]) == (
+        "org_id", "log_only", False, 5)
+    assert line["config_version"] == VERSION
+    rows, _ = metrics.drain()
+    assert any(r["layer"] == "blocklist" and r["result"] == "log_only" and r["mode"] == "log_only"
+               and r["config_version"] == VERSION for r in rows)
+
+
+async def test_other_orgs_and_expired_entries_do_not_match(clients, monkeypatch):
+    use(blocklist_mode="enforce_403")
+    caller = await _learn(clients)
+    await _load_blocklist(monkeypatch, ("org_id", str(caller.org_id + 1000), 3600),
+                          ("key_hash", crypto.hash_token(_token(clients)), -1))
+    assert (await clients.get("/tools")).status_code == 200
+
+
+async def test_blocklist_off_never_matches(clients, monkeypatch):
+    use(blocklist_mode="off")
+    await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token(_token(clients)), 3600))
+    assert (await clients.get("/tools")).status_code == 200
+
+
+async def test_server_credentials_are_never_blocklisted(clients, monkeypatch):
+    monkeypatch.setenv("TREG_ADMIN_TOKEN", "server-side-admin")
+    get_settings.cache_clear()
+    use(blocklist_mode="enforce_403")
+    await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token("server-side-admin"), 3600))
+    assert (await clients.get("/admin/kv", headers={"X-Treg-Token": "server-side-admin"})).status_code == 200
+
+
+async def test_store_down_keeps_the_last_good_blocklist(clients, monkeypatch):
+    use(blocklist_mode="enforce_403")
+    store = await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token(_token(clients)), 3600))
+    store.down = True
+    assert (await blocklist_state.refresh_once()).version == 5
+    assert (await clients.get("/tools")).status_code == 403
+    assert blocklist_state.counters()["blocklist_store_errors"] == 1
+
+
+@pytest.mark.parametrize("bad", ["{garbage", json.dumps({"schema_version": 2, "version": 9, "entries": []})])
+async def test_an_unparseable_or_unknown_schema_blocklist_keeps_the_last_good_and_alerts(
+        clients, monkeypatch, caplog, bad):
+    events: list = []
+    monkeypatch.setattr(analytics, "capture", lambda _id, event, props=None, **_: events.append(event))
+    use(blocklist_mode="enforce_403")
+    store = await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token(_token(clients)), 3600))
+    store.docs[kv.RL_BLOCKLIST_KEY] = bad
+    caplog.set_level(logging.ERROR, logger="treg.ratelimit")
+    assert (await blocklist_state.refresh_once()).version == 5
+    assert (await clients.get("/tools")).status_code == 403  # never read as empty
+    assert "ratelimit_blocklist_invalid" in events
+    assert any(r.getMessage().startswith("rate_limit_blocklist_invalid") for r in caplog.records)
+    assert blocklist_state.counters()["blocklist_invalid"] == 1
+
+
+async def test_a_missing_blocklist_is_never_read_as_empty(clients, monkeypatch):
+    use(blocklist_mode="enforce_403")
+    store = await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token(_token(clients)), 3600))
+    del store.docs[kv.RL_BLOCKLIST_KEY]
+    assert (await blocklist_state.refresh_once()).version == 5
+    assert blocklist_state.missing()
+    assert (await clients.get("/tools")).status_code == 403
+
+
+async def test_the_blocklist_loop_syncs_every_few_seconds_and_writes_a_heartbeat(monkeypatch):
+    store = install(monkeypatch)
+    store.docs[kv.RL_BLOCKLIST_KEY] = _blocklist(("org_id", "7", 3600), version=11)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(background.asyncio, "sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await background.blocklist_loop()
+    assert sleeps == [5.0, 5.0]
+    assert store.calls[f"rl_get:{kv.RL_BLOCKLIST_KEY}"] == 2
+    beat = json.loads(next(iter(store.live.values())))
+    assert (beat["blocklist_version"], beat["blocklist_entries"], beat["blocklist_mode"]) == (11, 1, "log_only")
+    assert {"config_version", "mode"} <= beat.keys()
+
+
+async def test_requests_never_read_the_policy_or_the_blocklist(clients, monkeypatch):
+    store = await _load_blocklist(monkeypatch, ("org_id", "999999", 3600))
+    store.docs[kv.RL_CONFIG_KEY] = config_state.encode_document(9, get_settings().rate_limit_defaults)
+    await config_state.refresh_once()
+    before = dict(store.calls)
+    for _ in range(5):
+        assert (await clients.get("/tools")).status_code == 200
+    reads = {k: v - before.get(k, 0) for k, v in store.calls.items() if k.startswith("rl_get")}
+    assert not any(reads.values())
+
+
+# ---- the global ceiling ---------------------------------------------------------------------------
+async def _hold(caller: Caller | None):
+    rl = limiter.limiter()
+    if caller is not None:
+        rl.cache.put(caller, now=rl._clock())
+    a = await rl.admit(RequestFacts(ip="198.51.100.7", key_id=caller.key_id if caller else None), {})
+    assert a.verdict.admitted
+    return a
+
+
+async def test_global_ceiling_in_shadow_logs_would_block_with_its_reason(clients, caplog):
+    use(global_concurrency=1)
+    await _learn(clients)
+    await _hold(None)
+    caplog.set_level(logging.INFO, logger="treg.ratelimit")
+    assert (await clients.get("/tools")).status_code == 200
+    line = _lines(caplog, "rate_limit_would_block")[-1]
+    assert (line["layer"], line["reason"], line["mode"], line["config_version"]) == (
+        "global_concurrency", "treg_rl.global_concurrency", "shadow", VERSION)
+    rows, _ = metrics.drain()
+    assert any(r["reason"] == "treg_rl.global_concurrency" and r["result"] == "shadow_reject"
+               and r["mode"] == "shadow" for r in rows)
+
+
+async def test_global_ceiling_in_enforce_answers_429_with_retry_after(clients):
+    use(mode="enforce", global_concurrency=1, concurrency_retry_after_s=3)
+    await _learn(clients)
+    await _hold(None)
+    r = await clients.get("/tools")
+    assert r.status_code == 429 and r.headers["retry-after"] == "3"
+    assert r.headers["x-treg-ratelimit-reason"] == "treg_rl.global_concurrency"
+    assert r.json()["detail"]["layer"] == "global_concurrency"
+    assert r.json()["detail"]["mode"] == "enforce"
+
+
+async def test_paid_orgs_keep_the_reserved_global_slots(clients):
+    use(mode="enforce", global_concurrency=2, global_paid_reserve=1)
+    caller = await _learn(clients)
+    await _hold(Caller("u" * 64, 999_001, "someone-unpaid", False, 0))
+    assert (await clients.get("/tools")).status_code == 429  # unpaid: only 1 of 2 slots usable
+    await _make_paid(caller.org_id)
+    _forget_keys()
+    assert (await _learn(clients)).paid
+    assert (await clients.get("/tools")).status_code == 200  # paid: may use the reserved slot
+
+
+async def test_the_blocklist_is_checked_before_the_global_ceiling(clients, monkeypatch):
+    use(mode="enforce", blocklist_mode="enforce_403", global_concurrency=1)
+    await _learn(clients)
+    await _hold(None)
+    await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token(_token(clients)), 3600))
+    assert (await clients.get("/tools")).status_code == 403
+
+
+async def test_exempt_paths_and_internal_calls_skip_the_ceiling(clients):
+    use(mode="enforce", global_concurrency=1)
+    await _learn(clients)
+    await _hold(None)
+    assert (await clients.get("/tools")).status_code == 429
+    assert (await clients.get("/health")).status_code != 429
+    token = _token(clients)
+    async with AsyncClient(transport=ASGITransport(app=request_scope.internal_app(app, outer_token=token)),
+                           base_url="http://treg.internal", headers={"X-Treg-Token": token}) as inner:
+        assert (await inner.get("/tools")).status_code == 200
+    assert (await clients.get("/tools", headers={"treg.internal": "1"})).status_code == 429
+
+
+async def test_the_ceiling_slot_is_given_back_when_the_app_raises():
+    use(mode="enforce", global_concurrency=1)
+
+    async def boom(scope, receive, send):
+        raise RuntimeError("handler failed")
+
+    middleware = RateLimitMiddleware(boom)
+    scope = {"type": "http", "path": "/tools", "headers": [], "client": (PEER, 1)}
+    for _ in range(3):  # a leaked slot would refuse the second attempt with a 429
+        with pytest.raises(RuntimeError):
+            await middleware(scope, None, None)
+    assert len(limiter.limiter().local) == 0
+
+
+async def test_store_errors_fail_open_and_cool_down(clients, monkeypatch):
+    store = install(monkeypatch)
+    use(mode="enforce")
+    for _ in range(3):
+        assert (await clients.get("/tools")).status_code == 200
+    assert store.calls["rl_admit_global"] == 1  # the cooldown kept the outage off later requests
+    _, gauge = metrics.drain()
+    assert gauge["store_errors"] == 1 and gauge["local_decisions"] == 3
+
+
+# ---- surge signals ---------------------------------------------------------------------------------
+async def test_signals_record_per_ip_and_org_and_never_refuse(clients):
+    use(mode="off")
+    caller = await _learn(clients)
+    await clients.get("/tools", headers={"X-Forwarded-For": "203.0.113.9"})
+    await clients.get("/tools", headers={"X-Treg-Token": "not-a-real-key"})
+    rows = signals._window.rows
+    ip = rows[("ip", PEER, None)]
+    assert ip.requests == 3 and ip.status_401 == 1 and ip.unknown_key_requests == 1
+    assert ip.orgs == {caller.org_id} and ip.max_in_flight >= 1
+    assert ("ip", "203.0.113.9", None) not in rows  # the forwarded-for header is never the client
+    assert rows[("org", None, caller.org_id)].requests == 2
+    assert rows[("ip_org", PEER, caller.org_id)].requests == 2
+
+
+async def test_signals_flush_on_their_own_pool_with_org_age_and_net_paid(clients, monkeypatch):
+    use(mode="off")
+    caller = await _learn(clients)
+    await _make_paid(caller.org_id)
+    await clients.get("/tools")
+    opened: list[str] = []
+    real = signals_flush.ratelimit_session_maker
+    monkeypatch.setattr(signals_flush, "ratelimit_session_maker", lambda: (opened.append("ratelimit"), real())[1])
+    assert await signals_flush.flush() == 3
+    assert opened == ["ratelimit"]
+    async with session_maker() as db:
+        rows = (await db.execute(select(SurgeSignal))).scalars().all()
+    org = next(r for r in rows if r.scope == "org")
+    assert (org.org_id, org.requests, org.net_paid_micro) == (caller.org_id, 2, 10_000_000)
+    assert org.org_created_at is not None and org.org_slug == caller.org_slug
+    ip = next(r for r in rows if r.scope == "ip")
+    assert ip.ip == PEER and ip.org_id is None and ip.distinct_orgs == 1 and ip.call_requests == 0
+    assert await signals_flush.flush() == 0  # the window was taken
+
+
+async def test_signals_are_bounded(clients, monkeypatch):
+    monkeypatch.setenv("TREG_SURGE_MAX_SUBJECTS", "10")
+    get_settings.cache_clear()
+    use(mode="off")
+    for i in range(15):
+        signals.leave(signals.enter(f"10.0.0.{i}", None, None, "/x", unknown=False),
+                      status=200, org_id=None, blocked=False)
+    assert len(signals._window.rows) == 10 and signals._window.dropped == 5
+
+
+async def test_an_uncached_key_is_counted_but_never_refused_by_the_ceiling(clients):
+    """A key's first request in a process (every key, after a deploy) cannot be starved: refused
+    before auth it would never be learned."""
+    use(mode="enforce", global_concurrency=1)
+    await _hold(None)
+    _forget_keys()
+    assert (await clients.get("/tools")).status_code == 200
+    rows, _ = metrics.drain()
+    assert any(r["tier"] == "unknown" and r["result"] == "shadow_reject" and r["mode"] == "enforce"
+               for r in rows)
+    assert (await clients.get("/tools")).status_code == 429  # known now, and unpaid

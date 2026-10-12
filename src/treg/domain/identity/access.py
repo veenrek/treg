@@ -325,6 +325,7 @@ async def require_member(
         if not (request.url.path.startswith("/call/") or request.method in ("GET", "HEAD", "OPTIONS")):
             raise HTTPException(status_code=403, detail=(
                 "this is a public demo team — its token can only call tools and read"))
+    _refuse_blocked_org(request, org)
     if x_treg_token:
         await _publish_rate_limit_caller(request, org, db)
     await db.commit()
@@ -339,6 +340,17 @@ async def _org_has_paid(db: AsyncSession, org_id: int) -> bool:
         CreditBlock.stripe_payment_intent.is_not(None),
     ).limit(1))).first()
     return row is not None
+
+
+def _refuse_blocked_org(request: Request, org: Org) -> None:
+    """The blocklist's after-auth check: the middleware put `check_org` in the scope slot; it
+    answers the 403 detail when this org is blocked and the blocklist enforces."""
+    slot = request.scope.get(request_scope.RATE_LIMIT)
+    check = slot.get("check_org") if isinstance(slot, dict) else None
+    detail = check(org.id) if callable(check) else None
+    if detail:
+        raise HTTPException(status_code=403, detail=detail,
+                            headers={"X-Treg-Block-Reason": detail["reason"]})
 
 
 async def _publish_rate_limit_caller(request: Request, org: Org, db: AsyncSession) -> None:
@@ -381,6 +393,20 @@ async def require_superadmin(
     if not x_treg_token and not treg_session:  # nothing presented → not authenticated
         raise HTTPException(status_code=401, detail="not authenticated")
     raise HTTPException(status_code=403, detail="super-admin required")
+
+
+async def require_blocklist_writer(
+    x_treg_token: str = Header(default=""),
+    treg_session: str = Cookie(default=""),
+    db: AsyncSession = Depends(get_admin_session),
+) -> str:
+    """The /admin/blocklist gate: the dedicated `blocklist_admin_token`, which opens nothing else,
+    or anything `require_superadmin` accepts."""
+    scoped = get_settings().blocklist_admin_token
+    if x_treg_token and scoped and hmac.compare_digest(x_treg_token, scoped):
+        await db.commit()
+        return "blocklist-token"
+    return await require_superadmin(x_treg_token, treg_session, db)
 
 
 def _role_at_least(role: str, minimum: str) -> bool:
