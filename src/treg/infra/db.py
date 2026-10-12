@@ -190,8 +190,8 @@ _background_engine = _new_engine("background")
 _ratelimit_engine = _new_engine("ratelimit")
 
 if _is_sqlite:
-    # No pool to protect, and file-level write locks it cannot share: three engines against one file
-    # would only manufacture "database is locked". Tests pin the routing, not the isolation.
+    # No pool to protect, and file-level write locks it cannot share: several engines against one
+    # file would only manufacture "database is locked". Tests pin the routing, not the isolation.
     _admin_engine = _background_engine = _ratelimit_engine = _engine
 
 _engines = (_engine, _admin_engine, _background_engine, _ratelimit_engine)

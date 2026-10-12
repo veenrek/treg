@@ -129,11 +129,12 @@ def test_each_module_reaches_only_for_its_own_pools(module_file):
     assert _maker_names(_modules_opening_sessions()[module_file]) == EXPECTED_MAKERS[module_file]
 
 
-def test_the_three_pools_are_separate_engines_on_a_real_database():
+def test_the_primary_pools_are_separate_engines_on_a_real_database():
     """On Postgres each class of work gets its own connections; on sqlite there is no pool to
-    protect and file-level write locks cannot be shared, so all three alias one engine."""
-    engines = {infra_db._engine, infra_db._admin_engine, infra_db._background_engine}
-    assert len(engines) == (1 if infra_db._is_sqlite else 3)
+    protect and file-level write locks cannot be shared, so they alias one engine."""
+    engines = {infra_db._engine, infra_db._admin_engine, infra_db._background_engine,
+               infra_db._ratelimit_engine}
+    assert len(engines) == (1 if infra_db._is_sqlite else 4)
 
 
 def test_no_minor_pool_can_outgrow_its_slots():
@@ -141,6 +142,7 @@ def test_no_minor_pool_can_outgrow_its_slots():
     pools; the API keeps its overflow because refusing a real call is the cost this exists to avoid."""
     assert infra_db.POOL_SPECS["admin"]["max_overflow"] == 0
     assert infra_db.POOL_SPECS["background"]["max_overflow"] == 0
+    assert infra_db.POOL_SPECS["ratelimit"]["max_overflow"] == 0
     assert infra_db.POOL_SPECS["api"]["max_overflow"] > 0
 
 
