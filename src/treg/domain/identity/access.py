@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 from dataclasses import dataclass
+from datetime import timezone
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request
 from sqlalchemy import update
@@ -12,8 +13,9 @@ from sqlmodel import select
 
 from ... import crypto
 from ...config import get_settings
+from ...infra import request_scope
 from ...infra.db import get_admin_session, get_session
-from ...models import ROLE_RANK, ApiKey, Membership, Org, User
+from ...models import ROLE_RANK, ApiKey, CreditBlock, Membership, Org, User
 from . import api_keys as managed_keys
 from . import session as sess
 
@@ -323,9 +325,33 @@ async def require_member(
         if not (request.url.path.startswith("/call/") or request.method in ("GET", "HEAD", "OPTIONS")):
             raise HTTPException(status_code=403, detail=(
                 "this is a public demo team — its token can only call tools and read"))
+    if x_treg_token:
+        await _publish_rate_limit_caller(request, org, db)
     await db.commit()
     managed_keys.touch(api_key)
     return Caller(membership=membership, user=user, org=org, api_key=api_key)
+
+
+async def _org_has_paid(db: AsyncSession, org_id: int) -> bool:
+    """Paid = the team has completed at least one Stripe top-up."""
+    row = (await db.execute(select(CreditBlock.id).where(
+        CreditBlock.org_id == org_id, CreditBlock.kind == "purchased",
+        CreditBlock.stripe_payment_intent.is_not(None),
+    ).limit(1))).first()
+    return row is not None
+
+
+async def _publish_rate_limit_caller(request: Request, org: Org, db: AsyncSession) -> None:
+    """Tell the rate-limit middleware which team this key acts for, so it can count the key from
+    its next request. Only when the middleware asked (its key cache missed): one indexed read
+    per key per cache lifetime, inside the session auth already holds."""
+    slot = request.scope.get(request_scope.RATE_LIMIT)
+    if not isinstance(slot, dict) or not slot.get("want_caller"):
+        return
+    slot["caller"] = {
+        "org_id": org.id, "org_slug": org.slug, "paid": await _org_has_paid(db, org.id),
+        "org_created_at": org.created_at.replace(tzinfo=timezone.utc).timestamp(),
+    }
 
 
 async def require_superadmin(

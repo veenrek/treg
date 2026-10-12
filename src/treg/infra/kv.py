@@ -12,6 +12,7 @@ not a generic get/set surface. Local counters do not pretend to provide distribu
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -50,6 +51,96 @@ if redis.call('get', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
+# The rate limiter's admission (domain/ratelimit/policy.py runs the same algorithm in-process).
+# ARGV[1] is the JSON plan with None fields omitted, because cjson decodes null to a sentinel.
+# KEYS lists the layer keys in plan order; the per-second request counters derive from them.
+_RL_ADMIT = """
+local spec = cjson.decode(ARGV[1])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local tight = false
+local distinct = -1
+local h = spec.hll
+if h then
+  redis.call('PFADD', h.key, h.member)
+  redis.call('EXPIRE', h.key, h.ttl_s)
+  distinct = redis.call('PFCOUNT', h.key)
+  if h.eligible == 1 and h.threshold and distinct > h.threshold then tight = true end
+end
+local out = {}
+local tokens = {}
+local all_ok = true
+local sec = math.floor(now / 1000)
+for i, l in ipairs(spec.layers) do
+  local key = KEYS[i]
+  local rate = l.rate
+  local cap = l.cap
+  if tight then
+    if l.trate then rate = l.trate end
+    if l.tcap then cap = l.tcap end
+  end
+  local ok = 1
+  local value = 0
+  local retry = 0
+  if l.kind == 'bucket' then
+    local qk = key .. ':q:' .. sec
+    value = redis.call('INCR', qk)
+    redis.call('PEXPIRE', qk, 2000)
+    if rate and cap then
+      local b = redis.call('HMGET', key, 't', 'ts')
+      local tok = tonumber(b[1])
+      local ts = tonumber(b[2])
+      if not tok then tok = cap; ts = now end
+      tok = math.min(cap, tok + math.max(0, now - ts) * rate / 1000)
+      tokens[i] = {tok, math.ceil(cap / rate * 1000) + 1000}
+      if tok < 1 then ok = 0; retry = math.ceil((1 - tok) * 1000 / rate) end
+    end
+  else
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', now - spec.ttl_ms)
+    value = redis.call('ZCARD', key) + 1
+    if cap and value > cap then ok = 0; retry = spec.retry_ms end
+  end
+  if ok == 0 then all_ok = false end
+  out[i] = {ok, value, cap or -1, retry}
+end
+local admitted = all_ok or spec.enforce ~= 1
+if admitted then
+  for i, l in ipairs(spec.layers) do
+    local key = KEYS[i]
+    if l.kind == 'bucket' then
+      local st = tokens[i]
+      if st then
+        local tok = st[1]
+        if tok >= 1 then tok = tok - 1 end
+        redis.call('HSET', key, 't', tostring(tok), 'ts', tostring(now))
+        redis.call('PEXPIRE', key, st[2])
+      end
+    else
+      redis.call('ZADD', key, now, spec.member)
+      redis.call('PEXPIRE', key, spec.ttl_ms)
+    end
+  end
+end
+return cjson.encode({admitted = admitted and 1 or 0, tight = tight and 1 or 0,
+                     distinct = distinct, layers = out})
+"""
+# Publish `rl:config` unless the stored document is a newer version (two admin writes racing).
+_RL_CONFIG_SET = """
+local cur = redis.call('GET', KEYS[1])
+if cur and ARGV[3] ~= '1' then
+  local ok, doc = pcall(cjson.decode, cur)
+  if ok and type(doc) == 'table' and tonumber(doc.version) and tonumber(doc.version) > tonumber(ARGV[2]) then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+"""
+RL_CONFIG_KEY = "rl:config"
+
+
+class Unavailable(Exception):
+    """The store cannot answer a rate-limit operation; the caller fails open."""
 
 
 class Store(Protocol):
@@ -66,6 +157,17 @@ class Store(Protocol):
                           deadline: float | None = None) -> RenewResult: ...
 
     async def release_lease(self, key: str, token: str) -> ReleaseResult: ...
+
+    # Rate limiting raises `Unavailable` instead of answering for the store; see application/ratelimit.
+    async def rl_admit(self, keys: list[str], spec: dict) -> dict: ...
+
+    async def rl_release(self, keys: list[str], member: str) -> None: ...
+
+    async def rl_config_get(self) -> str | None: ...
+
+    async def rl_config_set(self, value: str, version: int, *, force: bool = False) -> bool: ...
+
+    async def rl_memory(self, max_keys: int) -> dict: ...
 
     async def aclose(self) -> None: ...
 
@@ -105,6 +207,22 @@ class LocalStore:
 
     async def release_lease(self, key: str, token: str) -> ReleaseResult:
         return "unavailable"
+
+    # No shared store: the limiter runs its own per-process evaluator and the env defaults.
+    async def rl_admit(self, keys: list[str], spec: dict) -> dict:
+        raise Unavailable("no shared store")
+
+    async def rl_release(self, keys: list[str], member: str) -> None:
+        raise Unavailable("no shared store")
+
+    async def rl_config_get(self) -> str | None:
+        raise Unavailable("no shared store")
+
+    async def rl_config_set(self, value: str, version: int, *, force: bool = False) -> bool:
+        raise Unavailable("no shared store")
+
+    async def rl_memory(self, max_keys: int) -> dict:
+        raise Unavailable("no shared store")
 
     async def aclose(self) -> None:
         self._windows.clear()
@@ -228,6 +346,63 @@ class RedisStore:
             finally:
                 _record_lease_timing("release", outcome, started, retry=bool(attempt))
         return "unavailable"
+
+    async def rl_admit(self, keys: list[str], spec: dict) -> dict:
+        try:
+            async with asyncio.timeout(_TIMEOUT_S * 2):
+                raw = await self._client.eval(_RL_ADMIT, len(keys), *keys, json.dumps(spec))
+            return json.loads(raw)
+        except Exception as exc:  # noqa: BLE001 - cancellation still propagates
+            raise Unavailable(type(exc).__name__) from exc
+
+    async def rl_release(self, keys: list[str], member: str) -> None:
+        try:
+            async with asyncio.timeout(_TIMEOUT_S * 2):
+                async with self._client.pipeline(transaction=False) as pipe:
+                    for key in keys:
+                        pipe.zrem(key, member)
+                    await pipe.execute()
+        except Exception as exc:  # noqa: BLE001
+            raise Unavailable(type(exc).__name__) from exc
+
+    async def rl_config_get(self) -> str | None:
+        try:
+            async with asyncio.timeout(_TIMEOUT_S * 2):
+                return await self._client.get(RL_CONFIG_KEY)
+        except Exception as exc:  # noqa: BLE001
+            raise Unavailable(type(exc).__name__) from exc
+
+    async def rl_config_set(self, value: str, version: int, *, force: bool = False) -> bool:
+        try:
+            async with asyncio.timeout(_TIMEOUT_S * 2):
+                stored = await self._client.eval(_RL_CONFIG_SET, 1, RL_CONFIG_KEY, value,
+                                                 str(version), "1" if force else "0")
+            return bool(stored)
+        except Exception as exc:  # noqa: BLE001
+            raise Unavailable(type(exc).__name__) from exc
+
+    async def rl_memory(self, max_keys: int) -> dict:
+        """A bounded sample of what `rl:` keys occupy, next to the store's total, so a reader can
+        see the limiter crowding money-admission leases out of an LRU-evicting store."""
+        try:
+            async with asyncio.timeout(_TIMEOUT_S * 20):
+                keys: list[str] = []
+                async for key in self._client.scan_iter(match="rl:*", count=200):
+                    keys.append(key)
+                    if len(keys) >= max_keys:
+                        break
+                sizes: list = []
+                if keys:
+                    async with self._client.pipeline(transaction=False) as pipe:
+                        for key in keys:
+                            pipe.memory_usage(key)
+                        sizes = await pipe.execute()
+                info = await self._client.info("memory")
+            return {"rl_keys_sampled": len(keys), "rl_bytes_sampled": sum(int(s or 0) for s in sizes),
+                    "rl_sample_truncated": len(keys) >= max_keys,
+                    "kv_used_memory": int(info.get("used_memory", 0))}
+        except Exception as exc:  # noqa: BLE001
+            raise Unavailable(type(exc).__name__) from exc
 
     async def aclose(self) -> None:
         try:

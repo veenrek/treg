@@ -2064,3 +2064,19 @@ class OnboardingProfile(SQLModel, table=True):
     house_cost_micro: int = Field(default=0, sa_column=Column(BigInteger, nullable=False, server_default="0"))
     created_at: NaiveUTC = Field(default_factory=_now)
     finished_at: NaiveUTC | None = None
+
+
+class RateLimitConfigVersion(SQLModel, table=True):
+    """One row per write of the request rate-limit policy; the highest id is the current version.
+    `application/ratelimit/admin.py` is the only writer, through the admin endpoints, and it
+    publishes each row to the shared store's `rl:config`. Serving processes never read this table:
+    they read `rl:config` in a background task (docs/context/architecture/rate-limit.md)."""
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: NaiveUTC = Field(default_factory=_now)
+    actor: str                     # the admin principal (`require_superadmin`)
+    action: str                    # set | revert_to_shadow
+    mode: str                      # off | shadow | enforce, denormalised for a readable history
+    config: dict = Field(sa_column=Column(JSON, nullable=False))
+    note: str = ""
+    enforce_approval: str | None = None  # who approved refusing requests; required for enforce
+    previous_version: int | None = None

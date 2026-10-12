@@ -158,6 +158,7 @@ Regenerate via `scripts/build-map.py`.
 | `src/treg/alembic/versions/0066_endpointdaystat_verdicts.py` | architecture/catalog.md, architecture/data-model.md |
 | `src/treg/alembic/versions/0067_org_archive_opt_out.py` | architecture/archive.md |
 | `src/treg/alembic/versions/0069_platform_key_slot.py` | architecture/proxy-model.md |
+| `src/treg/alembic/versions/0069_rate_limit_config_version.py` | architecture/rate-limit.md |
 | `src/treg/analytics.py` | architecture/data-model.md |
 | `src/treg/api.py` | architecture/archive.md, architecture/money.md, architecture/multi-tenancy.md, architecture/proxy-model.md, architecture/super-admin.md, interface/api.md, interface/landing-sandbox.md, interface/seo.md |
 | `src/treg/application/__init__.py` | architecture/import-boundaries.md |
@@ -210,6 +211,12 @@ Regenerate via `scripts/build-map.py`.
 | `src/treg/application/onboard/sandbox.py` | interface/landing-sandbox.md |
 | `src/treg/application/onboard/tasks.py` | interface/onboarding.md |
 | `src/treg/application/provider_resources.py` | architecture/catalog.md, architecture/multi-tenancy.md, interface/api.md |
+| `src/treg/application/ratelimit/__init__.py` | architecture/rate-limit.md |
+| `src/treg/application/ratelimit/admin.py` | architecture/rate-limit.md |
+| `src/treg/application/ratelimit/background.py` | architecture/rate-limit.md |
+| `src/treg/application/ratelimit/config_state.py` | architecture/rate-limit.md |
+| `src/treg/application/ratelimit/limiter.py` | architecture/rate-limit.md |
+| `src/treg/application/ratelimit/metrics.py` | architecture/rate-limit.md |
 | `src/treg/application/referrals.py` | architecture/money.md, interface/api.md |
 | `src/treg/application/search_experiment.py` | architecture/search-experiment.md |
 | `src/treg/application/signup.py` | architecture/ads-conversions.md, architecture/money.md, architecture/multi-tenancy.md, interface/api.md |
@@ -224,6 +231,7 @@ Regenerate via `scripts/build-map.py`.
 | `src/treg/bootstrap.py` | architecture/archive.md, architecture/composition.md, architecture/find.md, interface/enrich-arena.md, interface/web-arena.md |
 | `src/treg/bootstrap_handlers.py` | architecture/composition.md, architecture/data-model.md, interface/api.md |
 | `src/treg/bootstrap_http.py` | architecture/composition.md, interface/api.md |
+| `src/treg/bootstrap_ratelimit.py` | architecture/rate-limit.md |
 | `src/treg/call_surface.py` | architecture/composition.md, architecture/proxy-model.md, architecture/table.md, interface/api.md |
 | `src/treg/caller_metadata.py` | architecture/multi-tenancy.md, interface/api.md |
 | `src/treg/catalog/adapters.yaml` | architecture/catalog.md |
@@ -359,7 +367,7 @@ Regenerate via `scripts/build-map.py`.
 | `src/treg/cli.py` | architecture/hub.md, architecture/instagram-oauth.md, interface/cli.md, interface/onboarding.md, interface/shell.md |
 | `src/treg/cli_analytics.py` | interface/cli.md |
 | `src/treg/client_identity.py` | architecture/import-boundaries.md, architecture/proxy-model.md, interface/api.md |
-| `src/treg/config.py` | architecture/archive.md, architecture/auth-secrets.md, architecture/feedback.md, architecture/super-admin.md, architecture/table.md, guides/expanding-a-category.md, interface/web-arena.md, ops/deploy.md |
+| `src/treg/config.py` | architecture/archive.md, architecture/auth-secrets.md, architecture/feedback.md, architecture/rate-limit.md, architecture/super-admin.md, architecture/table.md, guides/expanding-a-category.md, interface/web-arena.md, ops/deploy.md |
 | `src/treg/convert.py` | interface/cli.md |
 | `src/treg/crypto.py` | architecture/auth-secrets.md |
 | `src/treg/domain/__init__.py` | architecture/import-boundaries.md |
@@ -410,7 +418,7 @@ Regenerate via `scripts/build-map.py`.
 | `src/treg/domain/hub/manifest.py` | architecture/hub.md |
 | `src/treg/domain/hub/refs.py` | architecture/hub.md |
 | `src/treg/domain/identity/__init__.py` | architecture/import-boundaries.md |
-| `src/treg/domain/identity/access.py` | architecture/auth-secrets.md, architecture/mcp-oauth.md, architecture/multi-tenancy.md, architecture/super-admin.md, interface/api.md |
+| `src/treg/domain/identity/access.py` | architecture/auth-secrets.md, architecture/mcp-oauth.md, architecture/multi-tenancy.md, architecture/rate-limit.md, architecture/super-admin.md, interface/api.md |
 | `src/treg/domain/identity/api_keys.py` | architecture/auth-secrets.md, architecture/mcp-oauth.md, architecture/multi-tenancy.md, interface/api.md |
 | `src/treg/domain/identity/health.py` | architecture/mcp-oauth.md |
 | `src/treg/domain/identity/mcp_oauth.py` | architecture/composition.md, architecture/mcp-oauth.md, architecture/table.md, interface/api.md |
@@ -419,6 +427,8 @@ Regenerate via `scripts/build-map.py`.
 | `src/treg/domain/money/__init__.py` | architecture/hub.md, architecture/import-boundaries.md, architecture/money.md |
 | `src/treg/domain/money/settlement.py` | architecture/catalog.md, architecture/money.md |
 | `src/treg/domain/provider_resources.py` | architecture/catalog.md, architecture/data-model.md, architecture/multi-tenancy.md |
+| `src/treg/domain/ratelimit/__init__.py` | architecture/rate-limit.md |
+| `src/treg/domain/ratelimit/policy.py` | architecture/rate-limit.md |
 | `src/treg/domain/referrals.py` | architecture/data-model.md, architecture/money.md |
 | `src/treg/domain/table/__init__.py` | architecture/table.md |
 | `src/treg/domain/tools/__init__.py` | architecture/auth-secrets.md |
@@ -438,7 +448,7 @@ Regenerate via `scripts/build-map.py`.
 | `src/treg/infra/db.py` | architecture/data-model.md, architecture/multi-tenancy.md, ops/deploy.md |
 | `src/treg/infra/embed.py` | architecture/find.md |
 | `src/treg/infra/judge.py` | architecture/search-experiment.md |
-| `src/treg/infra/kv.py` | architecture/data-model.md, architecture/feedback.md |
+| `src/treg/infra/kv.py` | architecture/data-model.md, architecture/feedback.md, architecture/rate-limit.md |
 | `src/treg/infra/llm.py` | interface/onboarding.md |
 | `src/treg/infra/money_admission.py` | architecture/data-model.md, architecture/money.md, ops/deploy.md |
 | `src/treg/infra/money_admission_reporting.py` | architecture/composition.md, architecture/data-model.md |
@@ -449,6 +459,7 @@ Regenerate via `scripts/build-map.py`.
 | `src/treg/infra/oauth_exchange.py` | architecture/auth-secrets.md, architecture/instagram-oauth.md, guides/expanding-a-category.md |
 | `src/treg/infra/oauth_refresh.py` | architecture/auth-secrets.md |
 | `src/treg/infra/object_store.py` | architecture/archive.md |
+| `src/treg/infra/request_scope.py` | architecture/rate-limit.md |
 | `src/treg/infra/stripe.py` | architecture/money.md |
 | `src/treg/infra/upstream/__init__.py` | architecture/import-boundaries.md |
 | `src/treg/infra/upstream/aggregators/__init__.py` | architecture/import-boundaries.md, ops/capacity.md |
@@ -474,6 +485,7 @@ Regenerate via `scripts/build-map.py`.
 | `src/treg/routers/__init__.py` | interface/api.md |
 | `src/treg/routers/activity.py` | interface/api.md |
 | `src/treg/routers/admin.py` | architecture/archive.md, architecture/composition.md, architecture/money.md, architecture/super-admin.md, interface/api.md |
+| `src/treg/routers/admin_rate_limit.py` | architecture/rate-limit.md |
 | `src/treg/routers/api_keys.py` | architecture/auth-secrets.md, architecture/mcp-oauth.md, interface/api.md, interface/cli.md |
 | `src/treg/routers/arena.py` | interface/enrich-arena.md |
 | `src/treg/routers/auth.py` | architecture/composition.md, architecture/mcp-oauth.md, architecture/multi-tenancy.md, architecture/table.md, interface/api.md, interface/enrich-arena.md, interface/onboarding.md |
@@ -656,6 +668,11 @@ Regenerate via `scripts/build-map.py`.
 | `tests/test_pinned_read_scope.py` | architecture/multi-tenancy.md |
 | `tests/test_platform_accounts.py` | architecture/proxy-model.md |
 | `tests/test_postgres_reset.py` | architecture/data-model.md |
+| `tests/test_rate_limit_admin.py` | architecture/rate-limit.md |
+| `tests/test_rate_limit_config.py` | architecture/rate-limit.md |
+| `tests/test_rate_limit_middleware.py` | architecture/rate-limit.md |
+| `tests/test_rate_limit_policy.py` | architecture/rate-limit.md |
+| `tests/test_rate_limit_redis.py` | architecture/rate-limit.md |
 | `tests/test_redundant_index_migration.py` | architecture/data-model.md |
 | `tests/test_relay_content_length.py` | architecture/proxy-model.md |
 | `tests/test_released_cli_compat.py` | interface/cli.md |
@@ -698,6 +715,7 @@ Regenerate via `scripts/build-map.py`.
 | `architecture/money.md` | `tavily.yaml`, `tinyfish.yaml`, `test_tinyfish.py`, `__init__.py`, `settlement.py`, `__init__.py`, `models.py`, `billing.py`, `idempotency.py`, `intake.py`, `resolve.py`, `octen.py`, `service.py`, `async_bridge.py`, `route.py`, `reserve.py`, `settle.py`, `tomba.yaml`, `asynctasks.py`, `0017_async_task_record.py`, `0018_async_resource_ownership.py`, `0019_async_poll_failures.py`, `referrals.py`, `budgets.py`, `__init__.py`, `money_admission.py`, `money_session.py`, `runner.py`, `stripe.py`, `reconcile.py`, `referrals.py`, `api.py`, `signup.py`, `promotions.py`, `0033_signup_promo_eligibility.py`, `admin.py`, `billing.py`, `call.py`, `orgs.py`, `referrals.py`, `test_call_architecture.py`, `test_money_lock_order.py`, `test_money_admission.py`, `test_money_admission_application.py`, `test_money_admission_postgres.py`, `test_archive_batch_postgres.py`, `bench_money_admission.py`, `test_marketplace_call.py`, `test_asynctasks.py` |
 | `architecture/multi-tenancy.md` | `access.py`, `0042_pinned_read_scope.py`, `test_pinned_read_scope.py`, `models.py`, `api.py`, `caller_metadata.py`, `auth.py`, `asynctasks.py`, `resolve.py`, `provider_resources.py`, `provider_resources.py`, `provider_resources.py`, `0043_provider_resources.py`, `signup.py`, `access.py`, `budgets.py`, `publicdemo.py`, `teams.py`, `usage.py`, `access.py`, `api_keys.py`, `session.py`, `promotions.py`, `test_team_limit.py`, `test_auth.py`, `test_token_revocation.py`, `auth.py`, `orgs.py`, `resources.py`, `bundles.py`, `db.py`, `0017_async_task_record.py`, `0018_async_resource_ownership.py`, `test_asynctasks.py` |
 | `architecture/proxy-model.md` | `relay.py`, `jsontext.py`, `ssrf.py`, `api.py`, `authorize.py`, `idempotency.py`, `intake.py`, `resolve.py`, `reserve.py`, `settle.py`, `evidence.py`, `service.py`, `types.py`, `asynctasks.py`, `keyslots.py`, `0069_platform_key_slot.py`, `test_platform_accounts.py`, `client_identity.py`, `call_surface.py`, `sandbox_identity.py`, `access.py`, `publicdemo.py`, `usage.py`, `call.py`, `limits.py`, `test_ssrf_public_addresses.py`, `test_call_application_contract.py`, `test_call_cancellation.py`, `test_call_response_limits.py`, `test_error_capture.py`, `test_marketplace_call.py`, `test_oauth_billed.py`, `test_passthrough.py`, `test_tag_billing.py`, `test_tag_billing_adversarial.py`, `test_call_architecture.py`, `test_asynctasks.py`, `test_relay_content_length.py` |
+| `architecture/rate-limit.md` | `__init__.py`, `policy.py`, `__init__.py`, `limiter.py`, `config_state.py`, `background.py`, `metrics.py`, `admin.py`, `admin_rate_limit.py`, `bootstrap_ratelimit.py`, `request_scope.py`, `kv.py`, `config.py`, `access.py`, `0069_rate_limit_config_version.py`, `test_rate_limit_policy.py`, `test_rate_limit_config.py`, `test_rate_limit_middleware.py`, `test_rate_limit_admin.py`, `test_rate_limit_redis.py` |
 | `architecture/search-experiment.md` | `catalog_search.py`, `search_experiment.py`, `interleave.py`, `judge.py`, `0041_searchlog.py`, `0056_searchlog_verdict.py`, `search_experiment_report.sql`, `search_agent_bench.py`, `test_search_experiment.py`, `test_catalog_search.py`, `test_search_agent_bench.py` |
 | `architecture/super-admin.md` | `api.py`, `admin.py`, `evidence_retention.py`, `access.py`, `config.py` |
 | `architecture/table.md` | `__init__.py`, `table.py`, `table.py`, `call.py`, `call_surface.py`, `config.py`, `mcp_oauth.py`, `auth.py`, `auth.py`, `test_table.py`, `test_table_oauth.py` |

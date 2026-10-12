@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, PositiveInt, field_validator
+from pydantic import Field, PositiveInt, field_validator, model_validator
 from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -107,6 +107,32 @@ def _blocked_email_domains(raw: str) -> frozenset[str]:
     )
 
 
+def _tier(raw: dict) -> dict:
+    """Env JSON numbers arrive as floats; the count fields of a tier are integers."""
+    return {k: (v if k.endswith("_rate_per_s") or not float(v).is_integer() else int(v))
+            for k, v in raw.items()}
+
+
+def _rate_limit_defaults(s: "Settings"):
+    from .domain.ratelimit import RateLimitConfig
+
+    return RateLimitConfig.model_validate({
+        "mode": s.rate_limit_mode,
+        "paid": _tier(s.rate_limit_paid),
+        "unpaid": _tier(s.rate_limit_unpaid),
+        "tightened": _tier(s.rate_limit_tightened),
+        "new_org_age_s": s.rate_limit_new_org_age_s,
+        "ip_window_s": s.rate_limit_ip_window_s,
+        "ip_distinct_orgs_threshold": s.rate_limit_ip_distinct_orgs_threshold,
+        "ip_concurrency": s.rate_limit_ip_concurrency,
+        "global_concurrency": s.rate_limit_global_concurrency,
+        "global_paid_reserve": s.rate_limit_global_paid_reserve,
+        "concurrency_ttl_s": s.rate_limit_concurrency_ttl_s or (s.call_timeout_s + s.hold_grace_s),
+        "concurrency_retry_after_s": s.rate_limit_concurrency_retry_after_s,
+        "org_overrides": {slug: _tier(o) for slug, o in s.rate_limit_org_overrides.items()},
+    })
+
+
 # How treg introduces itself to a provider: on every call on its shared key (the relay's rewrite 5)
 # and as the default of the clients it calls providers with, never a library's own default.
 TREG_USER_AGENT = "treg/1.0 (+https://treg.to)"
@@ -132,6 +158,58 @@ class Settings(BaseSettings):
     money_admission_org_ids: list[PositiveInt] = Field(default_factory=list)
     money_admission_wait_s: float = Field(default=5.0, gt=0, le=60)
     money_admission_lease_s: float = Field(default=15.0, ge=3, le=300)
+
+    # ---- request rate limiting (application/ratelimit, docs/context/architecture/rate-limit.md) --
+    # Everything below `rate_limit_mode` is the DEFAULT policy: a process uses it until it has read
+    # a valid `rl:config` from the shared store, which an admin writes through
+    # /admin/rate-limit/config without a redeploy. `enforce` is refused here on purpose: refusing
+    # requests needs an audited admin write. An unset threshold measures its layer and refuses
+    # nothing; enforce figures come from measured shadow data, never from a guess in this file.
+    rate_limit_mode: str = "shadow"
+    rate_limit_paid: dict[str, float] = Field(default_factory=dict)
+    rate_limit_unpaid: dict[str, float] = Field(default_factory=dict)
+    rate_limit_tightened: dict[str, float] = Field(default_factory=dict)
+    rate_limit_org_overrides: dict[str, dict[str, float]] = Field(default_factory=dict)
+    rate_limit_new_org_age_s: int = 7 * 86_400
+    rate_limit_ip_window_s: int = 300
+    rate_limit_ip_distinct_orgs_threshold: int | None = None
+    rate_limit_ip_concurrency: int | None = None
+    rate_limit_global_concurrency: int | None = None
+    rate_limit_global_paid_reserve: int = 0
+    # Must outlast the longest request; empty = call_timeout_s + hold_grace_s.
+    rate_limit_concurrency_ttl_s: int | None = None
+    rate_limit_concurrency_retry_after_s: int = 1
+    # Process mechanics, not policy: these stay env-only.
+    rate_limit_config_refresh_s: float = Field(default=15.0, ge=1, le=300)
+    rate_limit_metrics_emit_s: float = Field(default=60.0, ge=5, le=3600)
+    rate_limit_key_cache_ttl_s: float = Field(default=60.0, ge=1, le=3600)
+    rate_limit_key_cache_size: int = Field(default=10_000, ge=100, le=1_000_000)
+    rate_limit_local_max_keys: int = Field(default=10_000, ge=100, le=1_000_000)
+    rate_limit_store_cooldown_s: float = Field(default=1.0, ge=0, le=60)
+    rate_limit_log_max_per_window: int = Field(default=600, ge=0, le=100_000)
+    rate_limit_exempt_paths: str = "/health,/stripe/webhook,/billing/stripe/webhook"
+
+    @field_validator("rate_limit_mode")
+    @classmethod
+    def _rate_limit_env_mode(cls, v: str) -> str:
+        if v not in ("off", "shadow"):
+            raise ValueError("rate_limit_mode from the environment must be off or shadow; "
+                             "enforce is set only through the audited admin endpoint")
+        return v
+
+    @model_validator(mode="after")
+    def _rate_limit_defaults_valid(self) -> "Settings":
+        self.rate_limit_defaults  # noqa: B018 - a bad default policy fails at boot
+        return self
+
+    @property
+    def rate_limit_defaults(self):
+        """The env policy as a validated `RateLimitConfig`."""
+        return _rate_limit_defaults(self)
+
+    @property
+    def rate_limit_exempt_path_set(self) -> frozenset[str]:
+        return frozenset(p.strip() for p in self.rate_limit_exempt_paths.split(",") if p.strip())
 
     # SQLite locally, Postgres on Render — same code path, just swap the URL.
     database_url: str = "sqlite+aiosqlite:///./treg.db"
