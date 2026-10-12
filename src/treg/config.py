@@ -172,12 +172,17 @@ class Settings(BaseSettings):
     rate_limit_log_max_per_window: int = Field(default=600, ge=0, le=100_000)
     rate_limit_exempt_paths: str = "/health,/stripe/webhook,/billing/stripe/webhook"
     # The per-process hard overload cap: an in-process semaphore, no shared store. When every permit
-    # is taken a request is refused at once with 503 `overload_cap`, never queued. Off by default;
-    # the size is a starting point of about 2-3x the API pool (15 per process), to be replaced by
-    # measured peak in-flight concurrency. Health checks and /admin/* are never counted.
+    # is taken a request is refused at once with 503 `overload_cap`, never queued. Health checks and
+    # /admin/* are never counted. Off by default. The size is PROVISIONAL: measured busy-hour
+    # in-flight concurrency per process is already above it, so it must be set from the
+    # `inflight_gauge` data below before the flag is turned on.
     overload_cap_enabled: bool = False
     overload_cap_size: int = Field(default=40, ge=1, le=10_000)
     overload_cap_retry_after_s: int = Field(default=1, ge=1, le=60)
+    # Per-process telemetry for sizing the cap: requests in flight and DB pool connections checked
+    # out, sampled every second and emitted (log line + metric, tagged with the pid) every N seconds.
+    inflight_gauge_enabled: bool = True
+    inflight_gauge_emit_s: float = Field(default=10.0, ge=1, le=3600)
     # A credential that authorizes the /admin/blocklist endpoints and nothing else: what an operator
     # tool or agent is given instead of the super-admin token. Empty = only super-admins may write.
     blocklist_admin_token: str = Field(default="", repr=False)

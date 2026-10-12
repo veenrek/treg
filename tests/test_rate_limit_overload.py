@@ -196,3 +196,77 @@ def test_a_hash_mismatch_never_matches():
     for value in (key.upper(), key[:-1] + "0", key[:63], "", None):
         assert bl.match("key_hash", value, now=0) is None
     assert bl.match("org_id", key, now=0) is None  # a hash is never compared as an org id
+
+
+# ---- per-process telemetry for sizing the cap -----------------------------------------------------
+from treg.application.ratelimit import background, inflight  # noqa: E402
+
+
+async def test_in_flight_is_counted_with_the_cap_off_and_never_leaks(monkeypatch):
+    monkeypatch.setenv("TREG_OVERLOAD_CAP_ENABLED", "false")
+    get_settings.cache_clear()
+    inflight.reset_for_tests()
+    gate = Gate()
+    mw = RateLimitMiddleware(gate)
+    held = [asyncio.create_task(_call(mw)) for _ in range(3)]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert inflight.current() == 3
+    held[0].cancel()
+    gate.release.set()
+    await asyncio.gather(*held, return_exceptions=True)
+
+    async def boom(scope, receive, send):
+        raise RuntimeError("x")
+
+    mw.app = boom
+    with pytest.raises(RuntimeError):
+        await _call(mw)
+    assert inflight.current() == 0
+    assert inflight.take_peak() == 3 and inflight.take_peak() == 0
+
+
+def test_the_gauge_emits_in_flight_and_db_pool_checkouts_tagged_with_the_pid(monkeypatch, caplog):
+    import logging
+    import os
+    inflight.reset_for_tests()
+    inflight.enter(); inflight.enter(); inflight.leave()
+    snapshots = iter([{"api": {"checked_out": 9, "capacity": 15}},
+                      {"api": {"checked_out": 4, "capacity": 15}}])
+    monkeypatch.setattr(background, "pool_snapshot", lambda: next(snapshots))
+    events: list = []
+    monkeypatch.setattr(background.analytics, "capture", lambda _id, e, p=None, **_: events.append((e, p)))
+    gauge = background.InflightGauge()
+    gauge.sample()
+    caplog.set_level(logging.INFO, logger="treg.ratelimit")
+    row = gauge.emit()
+    assert (row["pid"], row["in_flight"], row["in_flight_peak"]) == (os.getpid(), 1, 2)
+    assert (row["db_api_checked_out"], row["db_api_peak"], row["db_api_capacity"]) == (4, 9, 15)
+    assert (row["overload_cap_enabled"], row["overload_cap_size"]) == (True, 2)  # this file's fixture
+    assert events[0][0] == "inflight_gauge" and events[0][1]["pid"] == os.getpid()
+    assert any(r.getMessage().startswith("inflight_gauge {") for r in caplog.records)
+    inflight.leave()
+
+
+async def test_a_broken_gauge_never_stops_or_fails_anything(monkeypatch):
+    def broken():
+        raise RuntimeError("pool introspection failed")
+
+    monkeypatch.setattr(background, "pool_snapshot", broken)
+    sleeps: list = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+        if len(sleeps) == 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(background.asyncio, "sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await background.inflight_loop()
+    assert sleeps == [1.0, 1.0, 1.0]  # kept sampling through every failure
+
+    async def ok(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    assert _status(await _call(RateLimitMiddleware(ok))) == 200

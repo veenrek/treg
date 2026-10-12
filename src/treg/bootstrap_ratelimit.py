@@ -12,7 +12,7 @@ import hmac
 import json
 
 from . import crypto
-from .application.ratelimit import metrics
+from .application.ratelimit import inflight, metrics
 from .application.ratelimit.limiter import RequestFacts, limiter
 from .config import get_settings
 from .infra import request_scope
@@ -57,6 +57,13 @@ class RateLimitMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        inflight.enter()
+        try:
+            await self._capped(scope, receive, send)
+        finally:
+            inflight.leave()
+
+    async def _capped(self, scope, receive, send):
         s = get_settings()
         if not s.overload_cap_enabled or _overload_exempt(scope.get("path", "")):
             return await self._admit(scope, receive, send)

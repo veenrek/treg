@@ -12,6 +12,7 @@ sources:
   - src/treg/application/ratelimit/metrics.py
   - src/treg/application/ratelimit/signals.py
   - src/treg/application/ratelimit/signals_flush.py
+  - src/treg/application/ratelimit/inflight.py
   - src/treg/application/ratelimit/admin.py
   - src/treg/application/ratelimit/blocklist_admin.py
   - src/treg/application/ratelimit/receipts.py
@@ -49,7 +50,12 @@ Order per request:
    `Retry-After`, `reason: overload_cap` (`X-Treg-Overload-Reason`), at once; it never queues. The
    permit is held until the app returns, which for ASGI is after the last streamed chunk, a client
    disconnect, an exception or a cancellation. Health checks and `/admin/*` are not counted.
-   Distinct from the database pool's `503 treg_saturated`.
+   Distinct from the database pool's `503 treg_saturated`. The size is provisional: measured
+   busy-hour concurrency is above it, so it is set from `inflight_gauge` before the flag is on.
+   Every request is counted in flight (`inflight`) whether or not the cap is on;
+   `background.inflight_loop` samples that and the DB pools' checked-out connections every second
+   and emits `inflight_gauge` (pid, current and peak in flight, per-pool checked out, peak and
+   capacity) every `inflight_gauge_emit_s`, as a log line and a metric. Counter reads only.
 2. **Blocklist by key hash**, before auth (SHA-256 of the presented token, the `ApiKey.key_hash`
    spelling), and by org id when the key's org is already in the key cache.
 3. **Global concurrency ceiling** (below), last of the middleware's checks.

@@ -324,7 +324,7 @@ as_packages = true
 [[tool.importlinter.contracts]]
 name = "Rate-limit request path never touches the database"
 type = "forbidden"
-source_modules = ["treg.application.ratelimit.limiter", "treg.application.ratelimit.config_state", "treg.application.ratelimit.blocklist_state", "treg.application.ratelimit.signals", "treg.application.ratelimit.metrics", "treg.bootstrap_ratelimit"]
+source_modules = ["treg.application.ratelimit.limiter", "treg.application.ratelimit.config_state", "treg.application.ratelimit.blocklist_state", "treg.application.ratelimit.signals", "treg.application.ratelimit.metrics", "treg.application.ratelimit.inflight", "treg.bootstrap_ratelimit"]
 forbidden_modules = ["treg.models", "treg.infra.db", "sqlalchemy", "sqlmodel"]
 allow_indirect_imports = true
 as_packages = false
