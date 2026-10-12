@@ -52,6 +52,7 @@ sources:
   - src/treg/alembic/versions/0065_call_verdict.py
   - src/treg/alembic/versions/0066_endpointdaystat_verdicts.py
   - src/treg/alembic/versions/0070_api_key_spend_rollup.py
+  - src/treg/alembic/versions/0071_callrecord_call_ref_index.py
   - src/treg/timeutil.py
   - src/treg/infra/db.py
   - src/treg/infra/money_timing.py
@@ -331,6 +332,23 @@ uses this metadata, never the encrypted token's shape.
   `recounted_on`). `application/key_spend_rollup.py`, run as `treg-worker spend rollup`, is the
   only writer of both, and the Team and Usage pages read only them; see [money](money.md) § Spend
   per API key. Team deletion clears a team's rows.
+
+  **`ix_callrecord_call_ref`, and why a database could lack it.** The model and revision 0001
+  declare it, so every database Alembic created has it. A database that predates Alembic got
+  `call_ref` from the old `init_db` `ALTER TABLE ... ADD COLUMN`, which adds no index, and was
+  then only stamped at the baseline, so it never ran 0001's `create_index`. There every
+  `call_ref` lookup read the whole audit table: the spend rollup's key lookup
+  (`call_ref IN (...)`), `GET /calls/{call_ref}` and the async hit UPDATE in `audit.py`.
+  Revision 0071 builds it where it is missing: concurrently on Postgres, without the migration
+  statement timeout (a large table takes longer than 120 s), dropping and rebuilding an INVALID
+  index an interrupted build left behind, and leaving a valid one alone. Its downgrade is a no-op,
+  since 0001 owns the index. The general lesson: a stamped database has the baseline's tables,
+  not necessarily its indexes; check `pg_indexes` before relying on one.
+
+  The rollup's ledger walks state the watermark as an index bound, `created_at >= watermark AND
+  (created_at > watermark OR id > watermark_id)`, never as one OR: with the whole condition inside
+  the OR, Postgres bounds the `created_at` index scan only from above and walks it from its oldest
+  row on every batch.
 
   `refused_by` distinguishes a treg refusal (`auth`, `policy`, `balance`, `cap`, `resolution`,
   `request`, and other mechanism-specific values) from an upstream answer, where it is null.

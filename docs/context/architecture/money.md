@@ -708,7 +708,9 @@ day -> `spent_micro` and `charges`. `charges` counts settle entries with money, 
 routed call or an overflow hold settles more than once. The fold:
 
 - walks the ledger in `(created_at, id)` order from a persisted watermark (`ApiKeySpendCursor`;
-  ledger ids are random, so the id alone cannot be a cursor), over the `created_at` index;
+  ledger ids are random, so the id alone cannot be a cursor), over the `created_at` index, with the
+  watermark as the scan's lower bound (`created_at >= watermark AND (created_at > watermark OR
+  id > watermark_id)`), never inside one OR that the planner cannot bound;
 - leaves entries younger than a few minutes for the next run: the audit row that names the key is
   written after the settle, through a queue;
 - reads small batches, each in its own short transaction: lock the cursor row, read the entries,

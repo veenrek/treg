@@ -38,7 +38,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..infra.db import session_maker
@@ -106,6 +106,15 @@ async def _fold_into(db: AsyncSession, rows, buckets: dict[Bucket, list[int]]) -
         bucket[1] += 1
 
 
+def _after(at: datetime, entry_id: str) -> list:
+    """Entries after `(at, entry_id)` in `(created_at, id)` order. The bare `created_at >= at` is
+    what makes the watermark an index bound: with the whole condition inside one OR, Postgres
+    walks the `created_at` index from its first row on every batch. The OR then only orders the
+    entries that share the watermark's instant."""
+    return [LedgerEntry.created_at >= at,
+            or_(LedgerEntry.created_at > at, LedgerEntry.id > entry_id)]
+
+
 def _values(buckets: dict[Bucket, list[int]], at: datetime) -> list[dict]:
     return [dict(org_id=org_id, day=day, api_key_id=key_id, endpoint_id=endpoint_id,
                  spent_micro=spent, charges=charges, updated_at=at)
@@ -151,9 +160,7 @@ async def refresh(session_factory=session_maker, *, max_rows: int = 50_000,
                 select(LedgerEntry.org_id, LedgerEntry.call_id, LedgerEntry.endpoint_id,
                        LedgerEntry.amount_micro, LedgerEntry.created_at, LedgerEntry.id)
                 .where(LedgerEntry.kind == "settle", LedgerEntry.created_at < young,
-                       or_(LedgerEntry.created_at > state.watermark_at,
-                           and_(LedgerEntry.created_at == state.watermark_at,
-                                LedgerEntry.id > state.watermark_id)))
+                       *_after(state.watermark_at, state.watermark_id))
                 .order_by(LedgerEntry.created_at, LedgerEntry.id).limit(limit))).all()
             buckets: dict[Bucket, list[int]] = {}
             await _fold_into(db, [row[:5] for row in rows], buckets)
@@ -270,9 +277,7 @@ async def _recount_team(session_factory, org_id: int, first: datetime, until: da
                 select(LedgerEntry.org_id, LedgerEntry.call_id, LedgerEntry.endpoint_id,
                        LedgerEntry.amount_micro, LedgerEntry.created_at, LedgerEntry.id)
                 .where(LedgerEntry.org_id == org_id, LedgerEntry.kind == "settle",
-                       LedgerEntry.created_at < until,
-                       or_(LedgerEntry.created_at > after[0],
-                           and_(LedgerEntry.created_at == after[0], LedgerEntry.id > after[1])))
+                       LedgerEntry.created_at < until, *_after(*after))
                 .order_by(LedgerEntry.created_at, LedgerEntry.id).limit(batch_rows))).all()
             await _fold_into(db, [row[:5] for row in rows], buckets)
         if len(rows) < batch_rows:

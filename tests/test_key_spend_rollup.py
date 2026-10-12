@@ -254,3 +254,26 @@ async def test_a_dead_runs_recount_lease_expires(clients):
     assert (await rollup.refresh(session_maker, now=next_day + timedelta(minutes=11)))["recounted"] == 3
     for org_id in orgs:
         assert sum(v[0] for v in (await _rows(org_id)).values()) == 105
+
+
+async def test_the_watermark_bound_selects_exactly_the_entries_after_it(clients):
+    """`_after` is the index-friendly form of "(created_at, id) > watermark": the same rows as the
+    old OR form, including every entry that shares the watermark's instant. Both run in the
+    database, whose collation orders the ids."""
+    import random
+    from sqlalchemy import and_, or_, select as sql_select
+
+    org_id, _ = await _orgs(clients)
+    rnd = random.Random(3)
+    instants = [datetime(2026, 10, 1, 8) + timedelta(seconds=rnd.randint(0, 5)) for _ in range(60)]
+    await _add(*[_entry(org_id, f"w{i}", -1, at) for i, at in enumerate(instants)])
+    async with session_maker() as db:
+        def ids(clause):
+            return sql_select(LedgerEntry.id).where(*clause).order_by(LedgerEntry.created_at, LedgerEntry.id)
+        ordered = (await db.execute(sql_select(LedgerEntry.created_at, LedgerEntry.id)
+                                    .order_by(LedgerEntry.created_at, LedgerEntry.id))).all()
+        for at, entry_id in [ordered[0], ordered[17], ordered[30], ordered[-1], (datetime(2026, 10, 1, 8, 0, 2), "")]:
+            old = [or_(LedgerEntry.created_at > at, and_(LedgerEntry.created_at == at, LedgerEntry.id > entry_id))]
+            want = (await db.execute(ids(old))).scalars().all()
+            got = (await db.execute(ids(rollup._after(at, entry_id)))).scalars().all()
+            assert got == want

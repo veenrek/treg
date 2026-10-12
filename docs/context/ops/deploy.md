@@ -101,7 +101,11 @@ its own revision: its lock permits ordinary reads and writes, although it confli
 maintenance. Such a revision restores the caller's timeouts and handles interruption: invalid builds
 must be rebuilt, and a partially completed removal must be retryable. Revision `0061` removes only
 ordinary indexes with verified unique-constraint replacements; its rollback recreates those indexes
-concurrently and requires enough disk space for them.
+concurrently and requires enough disk space for them. Revision `0071` builds
+`ix_callrecord_call_ref` where a database stamped at the baseline never got it; a build on a large
+table outlasts any fixed statement timeout, so it lifts `statement_timeout` for that one statement
+(the lock timeout stays bounded) and the deploy's own pre-deploy limit bounds it. Deploy such a
+revision in a quiet window: the build reads the whole table while traffic keeps writing.
 
 Hot-table ALTERs stay cheap to retry when they sit in their own revision, add only nullable columns
 without defaults (metadata-only in PostgreSQL) and leave backfills and `NOT NULL` to later steps.
