@@ -23,7 +23,7 @@ sources:
   - src/treg/infra/db.py
   - src/treg/config.py
   - src/treg/domain/identity/access.py
-  - src/treg/alembic/versions/0069_rate_limit_config_version.py
+  - src/treg/alembic/versions/0070_request_admission.py
   - tests/test_rate_limit_policy.py
   - tests/test_rate_limit_config.py
   - tests/test_rate_limit_middleware.py
