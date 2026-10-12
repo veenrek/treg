@@ -68,8 +68,8 @@ POOL_SPECS: dict[str, dict[str, int]] = {
     "admin":      {"pool_size": 3, "max_overflow": 0},
     "background": {"pool_size": sum(BACKGROUND_CONSUMERS.values()), "max_overflow": 0},
     "read":       {"pool_size": 2, "max_overflow": 0},  # optional replica, a separate DB budget
-    # The rate limiter's background work, one task at a time: the blocklist version poll, the
-    # surge-signal flush and the restore of an evicted `rl:config`. Never the request pool.
+    # The rate limiter's background work, one task at a time: the policy and blocklist polls and
+    # the surge-signal flush. Never the request pool.
     "ratelimit":  {"pool_size": 1, "max_overflow": 0},
 }
 

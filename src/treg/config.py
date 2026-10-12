@@ -114,6 +114,7 @@ def _rate_limit_defaults(s: "Settings"):
         "mode": s.rate_limit_mode,
         "global_concurrency": s.rate_limit_global_concurrency,
         "global_paid_reserve": s.rate_limit_global_paid_reserve,
+        "anonymous_ip_concurrency": s.rate_limit_anonymous_ip_concurrency,
         "concurrency_ttl_s": s.rate_limit_concurrency_ttl_s or (s.call_timeout_s + s.hold_grace_s),
         "concurrency_retry_after_s": s.rate_limit_concurrency_retry_after_s,
     })
@@ -155,6 +156,12 @@ class Settings(BaseSettings):
     rate_limit_mode: str = "off"
     rate_limit_global_concurrency: int | None = None
     rate_limit_global_paid_reserve: int = 0
+    rate_limit_anonymous_ip_concurrency: int | None = None
+    # How many proxies append to X-Forwarded-For in front of this app. The client IP is the entry
+    # that many from the right: the one the nearest proxy appended, never one the client wrote.
+    # 0 = no proxy, use the TCP peer. A deployment with no proxy in front must set 0, or a client
+    # could choose its own IP.
+    rate_limit_proxy_hops: int = Field(default=1, ge=0, le=5)
     # Must outlast the longest request; empty = call_timeout_s + hold_grace_s.
     rate_limit_concurrency_ttl_s: int | None = None
     rate_limit_concurrency_retry_after_s: int = 1
@@ -175,8 +182,6 @@ class Settings(BaseSettings):
     # statement_timeout and connect timeout on the dedicated `ratelimit` pool (Postgres only).
     rate_limit_db_statement_timeout_ms: int = Field(default=2000, ge=100, le=30_000)
     rate_limit_db_connect_timeout_s: float = Field(default=2.0, ge=0.1, le=30)
-    # A missing `rl:config` is restored from Postgres at most this often, fleet-wide.
-    rate_limit_republish_interval_s: int = Field(default=60, ge=60, le=3600)
     rate_limit_key_cache_ttl_s: float = Field(default=60.0, ge=1, le=3600)
     rate_limit_key_cache_size: int = Field(default=10_000, ge=100, le=1_000_000)
     rate_limit_store_cooldown_s: float = Field(default=1.0, ge=0, le=60)

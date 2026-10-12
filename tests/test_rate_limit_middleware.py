@@ -81,7 +81,7 @@ def _token(client) -> str:
 async def _learn(client) -> Caller:
     """The first request of a key teaches the cache who it is."""
     assert (await client.get("/tools")).status_code == 200
-    caller = limiter.limiter().cache.get(request_scope.key_id(_token(client)), now=limiter.limiter()._clock())
+    caller = limiter.limiter().cache.get(request_scope.key_hash(_token(client)), now=limiter.limiter()._clock())
     assert caller is not None
     return caller
 
@@ -112,7 +112,7 @@ async def test_a_blocked_key_hash_is_refused_403_before_auth(clients, monkeypatc
     assert r.headers["x-treg-block-reason"] == "treg_blocklist.key_hash"
     assert r.json()["detail"] == {"error": "blocked", "reason": "treg_blocklist.key_hash",
                                   "blocklist_version": 5}
-    assert limiter.limiter().cache.get(request_scope.key_id(_token(clients)), now=1e12) is None
+    assert limiter.limiter().cache.get(request_scope.key_hash(_token(clients)), now=1e12) is None
 
 
 async def test_a_blocked_org_is_refused_after_auth_even_on_a_keys_first_request(clients, monkeypatch):
@@ -172,13 +172,23 @@ async def test_server_credentials_are_never_blocklisted(clients, monkeypatch):
 
 
 async def test_requests_never_read_the_policy_or_the_blocklist(clients, monkeypatch):
+    from sqlalchemy import event
+    from treg.application.ratelimit import config_sync
+    from treg.infra import db as infra_db
     await _load_blocklist(monkeypatch, ("org_id", "999999", 3600))
     store = install(monkeypatch)
-    store.docs[kv.RL_CONFIG_KEY] = config_state.encode_document(9, get_settings().rate_limit_defaults)
-    await config_state.refresh_once()
+    await config_sync.poll_once()
+    seen: list[str] = []
+    engine = infra_db._ratelimit_engine.sync_engine
+    listener = lambda conn, cursor, statement, *a: seen.append(statement)
     before = dict(store.calls)
-    for _ in range(5):
-        assert (await clients.get("/tools")).status_code == 200
+    event.listen(engine, "before_cursor_execute", listener)
+    try:
+        for _ in range(5):
+            assert (await clients.get("/tools")).status_code == 200
+    finally:
+        event.remove(engine, "before_cursor_execute", listener)
+    assert not [q for q in seen if "ratelimitconfigversion" in q or "blocklist" in q]
     reads = {k: v - before.get(k, 0) for k, v in store.calls.items() if k.startswith("rl_get")}
     assert not any(reads.values())
     assert blocklist_state.counters()["blocklist_reloads"] == 1  # only the install above
@@ -189,7 +199,7 @@ async def _hold(caller: Caller | None):
     rl = limiter.limiter()
     if caller is not None:
         rl.cache.put(caller, now=rl._clock())
-    a = await rl.admit(RequestFacts(ip="198.51.100.7", key_id=caller.key_id if caller else None), {})
+    a = await rl.admit(RequestFacts(ip="198.51.100.7", key_hash=caller.key_id if caller else None), {})
     assert a.verdict.admitted
     return a
 
@@ -270,24 +280,27 @@ async def test_store_errors_fail_open_and_cool_down(clients, monkeypatch):
     use(mode="enforce")
     for _ in range(3):
         assert (await clients.get("/tools")).status_code == 200
-    assert store.calls["rl_admit_global"] == 1  # the cooldown kept the outage off later requests
+    assert store.calls["rl_admit_key"] == 1  # the cooldown kept the outage off later requests
     _, gauge = metrics.drain()
-    assert gauge["store_errors"] == 1 and gauge["local_decisions"] == 3
+    # The key's first request takes two leases (its IP bucket while unresolved, and the global one).
+    assert gauge["store_errors"] == 1 and gauge["local_decisions"] == 4
 
 
 # ---- surge signals ---------------------------------------------------------------------------------
 async def test_signals_record_per_ip_and_org_and_never_refuse(clients):
     use(mode="off")
     caller = await _learn(clients)
-    await clients.get("/tools", headers={"X-Forwarded-For": "203.0.113.9"})
+    # The proxy appends the real client last; whatever the client wrote before it is ignored.
+    await clients.get("/tools", headers={"X-Forwarded-For": "6.6.6.6, 203.0.113.9"})
     await clients.get("/tools", headers={"X-Treg-Token": "not-a-real-key"})
     rows = signals._window.rows
     ip = rows[("ip", PEER, None)]
-    assert ip.requests == 3 and ip.status_401 == 1 and ip.unknown_key_requests == 1
+    assert ip.requests == 2 and ip.status_401 == 1 and ip.unknown_key_requests == 1
     assert ip.orgs == {caller.org_id} and ip.max_in_flight >= 1
-    assert ("ip", "203.0.113.9", None) not in rows  # the forwarded-for header is never the client
+    assert rows[("ip", "203.0.113.9", None)].requests == 1
+    assert ("ip", "6.6.6.6", None) not in rows  # the client-written entry is never the client
     assert rows[("org", None, caller.org_id)].requests == 2
-    assert rows[("ip_org", PEER, caller.org_id)].requests == 2
+    assert rows[("ip_org", PEER, caller.org_id)].requests == 1
 
 
 async def test_signals_flush_on_their_own_pool_with_org_age_and_net_paid(clients, monkeypatch):

@@ -63,7 +63,7 @@ async def _org_of(client) -> int:
     r = await client.get("/tools")
     assert r.status_code == 200
     rl = limiter.limiter()
-    return rl.cache.get(request_scope.key_id(client.headers["X-Treg-Token"]), now=rl._clock()).org_id
+    return rl.cache.get(request_scope.key_hash(client.headers["X-Treg-Token"]), now=rl._clock()).org_id
 
 
 # ---- MUST 1: an org block short-circuits before the auth DB query ---------------------------------
@@ -93,7 +93,7 @@ async def test_a_bearer_and_mcp_caller_is_cached_and_refused_before_auth(clients
                            base_url="http://treg.internal", headers={"X-Treg-Token": token}) as inner:
         assert (await inner.get("/tools")).status_code == 403  # the MCP tool's /call/, refused by auth
     rl = limiter.limiter()
-    assert rl.cache.get(request_scope.key_id(token), now=rl._clock()).org_id == org_id
+    assert rl.cache.get(request_scope.key_hash(token), now=rl._clock()).org_id == org_id
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://registry") as outer:
         with _db_checkouts() as seen:
             r = await outer.post("/mcp/", headers={"Authorization": f"Bearer {token}"},
@@ -107,7 +107,7 @@ async def test_bearer_keys_are_cached_after_a_served_request(clients):
     async with AsyncClient(transport=ASGITransport(app=request_scope.internal_app(app, outer_token=token)),
                            base_url="http://treg.internal", headers={"X-Treg-Token": token}) as inner:
         assert (await inner.get("/tools")).status_code == 200
-    facts_key = request_scope.key_id(token)  # what the middleware derives from `Authorization: Bearer`
+    facts_key = request_scope.key_hash(token)  # what the middleware derives from `Authorization: Bearer`
     rl = limiter.limiter()
     assert rl.cache.get(facts_key, now=rl._clock()) is not None
 

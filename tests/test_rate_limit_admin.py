@@ -340,16 +340,6 @@ async def test_revert_to_shadow_is_one_audited_action(clients, store):
     assert json.loads(store.docs[kv.RL_CONFIG_KEY])["config"]["mode"] == "shadow"
 
 
-async def test_an_evicted_policy_is_restored_from_postgres(clients, store):
-    v = (await clients.put("/admin/rate-limit/config", headers=ADMIN_H,
-                           json={"config": _policy(global_concurrency=70), "note": "x"})).json()["version"]
-    await config_state.refresh_once()
-    del store.docs[kv.RL_CONFIG_KEY]
-    assert (await config_state.refresh_once()).version == v
-    assert await background.maybe_restore("config") == v
-    assert (await config_state.refresh_once()).config.global_concurrency == 70
-
-
 # ---- hard-off write routes ----------------------------------------------------------------------
 WRITES = [("post", "/admin/blocklist", {"entries": [{"type": "org_id", "value": "1"}], "reason": "r",
                                         "approved_by": "o", "evidence": {"q": 1}}),

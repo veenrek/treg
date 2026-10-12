@@ -2,9 +2,10 @@
 
 Pure rules, no I/O. Batch 1 of the design (docs/context/architecture/rate-limit.md):
 
-- The **global concurrency ceiling** is the only counting layer. It is evaluated after every other
-  check, and `global_paid_reserve` of its slots are usable by paid orgs only, so unpaid traffic is
-  shed first. Its mode is `off`, `shadow` or `enforce`.
+- Two counting layers, both leases: a small per-IP bucket for a request whose credential is not
+  resolved, then the **global concurrency ceiling**. The ceiling is evaluated last, and
+  `global_paid_reserve` of its slots are usable by paid orgs only, so unpaid traffic is shed
+  first. Its mode is `off`, `shadow` or `enforce`.
 - The **blocklist** refuses a key hash before auth and an org id after auth. Its entries and its
   mode (`off`, `log_only` or `enforce_403`) come from Postgres (`application.ratelimit.blocklist_sync`).
 """
@@ -26,6 +27,7 @@ MatchType = Literal["key_hash", "org_id"]
 
 # One label per refusing layer, distinct from any other mitigation's labels.
 GLOBAL_REASON = "treg_rl.global_concurrency"
+ANONYMOUS_IP_REASON = "treg_rl.anonymous_ip_concurrency"
 BLOCKLIST_REASONS = {"key_hash": "treg_blocklist.key_hash", "org_id": "treg_blocklist.org_id"}
 
 # Write-time sanity ceilings: a value past one of these is a typo, not a policy.
@@ -47,6 +49,9 @@ class RateLimitConfig(_Strict):
     # None = measured, never refused. Set from measured peak in-flight concurrency, not a guess.
     global_concurrency: int | None = Field(ge=1, le=MAX_GLOBAL_CONCURRENCY)
     global_paid_reserve: int = Field(ge=0, le=MAX_GLOBAL_CONCURRENCY)
+    # In flight per client IP for requests whose credential is not resolved (none, or not yet
+    # accepted by auth). None = measured, never refused.
+    anonymous_ip_concurrency: int | None = Field(ge=1, le=MAX_GLOBAL_CONCURRENCY)
     concurrency_ttl_s: int = Field(ge=30, le=MAX_TTL_S)
     concurrency_retry_after_s: int = Field(ge=1, le=300)
 
@@ -106,6 +111,11 @@ class LocalCeiling:
 
     def release(self, member: str) -> None:
         self._members.pop(member, None)
+
+    def renew(self, member: str, *, now_ms: int) -> None:
+        """The request is still running: restart its entry's age."""
+        if member in self._members:
+            self._members[member] = now_ms
 
     def __len__(self) -> int:
         return len(self._members)

@@ -225,6 +225,9 @@ async def require_member(
         await _membership_and_key_by_token(x_treg_token, db)
         if x_treg_token else (None, None)
     )
+    # Whether the credential alone fixes the team (the request's X-Treg-Org cannot change it):
+    # the rate limiter then identifies the caller by the credential's hash and nothing else.
+    pinned = membership is not None
     if membership is not None:  # per-org token — the org is baked in
         user = await db.get(User, membership.user_id)
         org = await db.get(Org, membership.org_id)
@@ -260,6 +263,7 @@ async def require_member(
         # New Default keys are explicitly team-scoped, so their signed team is authoritative.
         # Older unmarked identity tokens retain the header-first behavior during migration.
         if (identity_claims or {}).get("scope") == sess.TEAM_SCOPE:
+            pinned = True
             if x_treg_org:
                 requested = await _resolve_org(x_treg_org, db)
                 claimed = await _resolve_org(claimed_org, db)
@@ -328,7 +332,8 @@ async def require_member(
     # Publish first: a blocked org's key is then cached, so its next request is refused by the
     # middleware before any session opens.
     if x_treg_token:
-        await _publish_rate_limit_caller(request, org, db)
+        await _publish_rate_limit_caller(request, org, db, token=x_treg_token, pinned=pinned,
+                                         org_header=x_treg_org)
     _refuse_blocked_org(request, org)
     await db.commit()
     managed_keys.touch(api_key)
@@ -355,14 +360,19 @@ def _refuse_blocked_org(request: Request, org: Org) -> None:
                             headers={"X-Treg-Block-Reason": detail["reason"]})
 
 
-async def _publish_rate_limit_caller(request: Request, org: Org, db: AsyncSession) -> None:
-    """Tell the rate-limit middleware which team this key acts for, so it can count the key from
-    its next request. Only when the middleware asked (its key cache missed): one indexed read
-    per key per cache lifetime, inside the session auth already holds."""
+async def _publish_rate_limit_caller(request: Request, org: Org, db: AsyncSession, *, token: str,
+                                     pinned: bool, org_header: str) -> None:
+    """Tell the rate-limit middleware which team the credential auth just accepted acts for, so
+    it can count that credential from its next request. The hash is of the credential auth
+    actually used, so a header auth ignores can never become part of the limiter's identity.
+    Only when the middleware asked (its key cache missed): one indexed read per key per cache
+    lifetime, inside the session auth already holds."""
     slot = request.scope.get(request_scope.RATE_LIMIT)
     if not isinstance(slot, dict) or not slot.get("want_caller"):
         return
     slot["caller"] = {
+        "key_hash": request_scope.key_hash(token), "pinned": pinned,
+        "org_header": "" if pinned else org_header,
         "org_id": org.id, "org_slug": org.slug, "paid": await _org_has_paid(db, org.id),
         "org_created_at": org.created_at.replace(tzinfo=timezone.utc).timestamp(),
     }

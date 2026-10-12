@@ -1,16 +1,17 @@
-"""The process's admission policy: one in-memory value, replaced only by the background refresh.
+"""The process's admission policy: one in-memory value, replaced only by `config_sync`.
 
-The request path reads `current()` and nothing else. `refresh_once` reads `rl:config` from the
-shared store, validates it, and swaps it in. A bad, missing or unreadable value keeps the last good
-policy, for at most `rate_limit_config_max_age_s`; past that an `enforce` policy is served as
-`shadow` and the process alerts. With no good policy at all the env defaults serve (their mode is
-`off` or `shadow` by construction) and the process alerts. A missing key is flagged for
-`background`, which restores it from Postgres; this module never touches the database.
+The request path reads `current()` and nothing else; this module never touches the database or
+the shared store. `config_sync` reads the newest `RateLimitConfigVersion` row from Postgres (the
+only source; the Redis copy is a cache nothing serves from) and calls `install`, `no_policy` or
+`fail`. A bad or unreadable policy keeps the last good one, for at most
+`rate_limit_config_max_age_s`; past that an `enforce` policy is served as `shadow` and the process
+alerts. With no good policy and an unreadable database the env defaults serve (their mode is `off`
+or `shadow` by construction) and the process alerts. An empty table is not a fault: nothing was
+ever written, so the env defaults are the policy.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
@@ -22,11 +23,10 @@ from pydantic import ValidationError
 from ... import analytics
 from ...config import get_settings
 from ...domain.ratelimit import RateLimitConfig
-from ...infra import kv
 
 log = logging.getLogger("treg.ratelimit")
 
-Source = Literal["env", "store"]
+Source = Literal["env", "db"]
 _clock = time.monotonic
 
 
@@ -35,7 +35,7 @@ class ConfigState:
     config: RateLimitConfig
     version: int  # 0 = the env defaults
     source: Source
-    # True while the shared store is configured but no valid document has been read.
+    # True while the env defaults serve because Postgres could not be read.
     fallback: bool
     # True while serving a last good policy older than the max age, demoted to shadow.
     degraded: bool = False
@@ -82,16 +82,15 @@ def encode_document(version: int, config: RateLimitConfig, **meta) -> str:
                       separators=(",", ":"), sort_keys=True)
 
 
-def _env_state() -> ConfigState:
-    return ConfigState(get_settings().rate_limit_defaults, 0, "env", fallback=kv.configured())
+def _env_state(*, fallback: bool = False) -> ConfigState:
+    return ConfigState(get_settings().rate_limit_defaults, 0, "env", fallback=fallback)
 
 
 _state: ConfigState | None = None
 _last_good: ConfigState | None = None
 _last_good_at = 0.0  # monotonic time of the last successful read
 _last_problem: str | None = None
-_missing = False
-_alerts = {"config_fallback_alerts": 0, "config_stale_alerts": 0, "config_store_errors": 0}
+_alerts = {"config_fallback_alerts": 0, "config_stale_alerts": 0, "config_read_errors": 0}
 
 
 def current() -> ConfigState:
@@ -99,11 +98,6 @@ def current() -> ConfigState:
     if _state is None:
         _state = _env_state()  # until the first refresh; only a refresh that finds nothing alerts
     return _state
-
-
-def missing() -> bool:
-    """`rl:config` was absent at the last read: `background` should restore it from Postgres."""
-    return _missing
 
 
 def age_s() -> float | None:
@@ -158,47 +152,53 @@ def _keep(why: str) -> None:
                    mode=demoted.mode)
         _swap(replace(_last_good, config=demoted, degraded=True))
         return
-    fresh = _env_state()
-    if fresh.fallback and first:
+    fresh = _env_state(fallback=True)
+    if first:
         _alert("config_fallback_alerts", "rate_limit_config_env_fallback", reason=why,
                mode=fresh.config.mode)
     _swap(fresh)
 
 
-async def refresh_once(store: kv.Store | None = None) -> ConfigState:
-    global _last_good, _last_good_at, _last_problem, _missing
+def install(version: int, raw: object) -> ConfigState:
+    """The newest Postgres row. Validated; a bad one keeps the last good policy and alerts."""
+    global _last_good, _last_good_at, _last_problem
     current()
-    if not kv.configured() and store is None:
-        _swap(_env_state())
-        return _state
-    store = store or kv.store()
-    try:
-        raw = await store.rl_get(kv.RL_CONFIG_KEY)
-    except kv.Unavailable as exc:
-        _alerts["config_store_errors"] += 1
-        _keep(f"store unavailable: {exc}")
-        return _state
-    _missing = raw is None
-    if raw is None:
-        _keep("missing")
+    if _last_good is not None and _last_good.version == version:
+        _last_good_at = _clock()  # unchanged, and read fresh just now
+        _last_problem = None
+        _swap(_last_good)
         return _state
     try:
-        version, config = parse_document(raw)
+        config = validate(raw)
     except InvalidConfig as exc:
-        digest = hashlib.sha256(raw.encode()).hexdigest()[:12]
-        _keep(f"invalid {digest}: {exc}")
+        _keep(f"invalid version {version}: {exc}")
         return _state
-    _last_good = ConfigState(config, version, "store", fallback=False)
+    _last_good = ConfigState(config, version, "db", fallback=False)
     _last_good_at = _clock()
     _last_problem = None
     _swap(_last_good)
     return _state
 
 
+def no_policy() -> ConfigState:
+    """The table is empty: nothing was ever written, so the env defaults are the policy."""
+    global _last_problem
+    current()
+    _last_problem = None
+    _swap(_env_state())
+    return _state
+
+
+def fail(why: str) -> ConfigState:
+    _alerts["config_read_errors"] += 1
+    current()
+    _keep(why)
+    return _state
+
+
 def reset_for_tests() -> None:
-    global _state, _last_good, _last_good_at, _last_problem, _missing
+    global _state, _last_good, _last_good_at, _last_problem
     _state = _last_good = _last_problem = None
     _last_good_at = 0.0
-    _missing = False
     for k in _alerts:
         _alerts[k] = 0

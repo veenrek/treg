@@ -1,12 +1,10 @@
 """The rate limiter's background work, started by every role's lifespan.
 
-- `config_loop`: reads `rl:config` every `rate_limit_config_refresh_s`.
+- `config_loop`: reads the newest policy row from Postgres every `rate_limit_config_refresh_s`.
 - `blocklist_loop`: polls the blocklist version in Postgres every `rate_limit_blocklist_refresh_s`
   (`blocklist_sync`), reporting `blocklist_cache_empty` until a list has loaded, and writes this
   process's heartbeat (versions and modes) to `rl:live:<instance>`, which the admin status reads.
-- `maybe_restore`: when `rl:config` is missing (the store evicts by LRU), republishes it from
-  Postgres on the `ratelimit` pool. A store claim limits that to once per
-  `rate_limit_republish_interval_s` across every process; missing never means empty.
+- `lease_loop`: renews the concurrency leases of requests still in flight.
 - `maintenance_loop`: flushes surge signals and emits the window's telemetry.
 
 A failed pass never ends a loop. Nothing here runs on the request path.
@@ -23,15 +21,13 @@ import time
 from ... import analytics
 from ...config import get_settings
 from ...infra import kv
-from ...infra.db import install_checkout_peaks, pool_snapshot, ratelimit_session_maker, take_checkout_peaks
+from ...infra.db import install_checkout_peaks, pool_snapshot, take_checkout_peaks
 from ...infra.money_timing import PROCESS_INSTANCE
-from . import admin as config_admin
-from . import blocklist_state, blocklist_sync, config_state, inflight, metrics, receipts, signals_flush
+from . import blocklist_state, blocklist_sync, config_state, config_sync, inflight, metrics, receipts, signals_flush
 from .limiter import limiter
 
 log = logging.getLogger("treg.ratelimit")
 _MEMORY_SAMPLE_KEYS = 500
-_last_restore: dict[str, float] = {}
 
 
 def process_status() -> dict:
@@ -45,28 +41,6 @@ def process_status() -> dict:
         "config_degraded": state.degraded, "config_age_s": None if age is None else round(age),
         **blocklist_state.status(now=time.time()),
     }
-
-
-async def maybe_restore(name: str) -> int | None:
-    """Republish `rl:<name>` from Postgres when it went missing, at most once per interval."""
-    if name != "config" or not config_state.missing() or not kv.configured():
-        return None
-    interval = get_settings().rate_limit_republish_interval_s
-    now = time.monotonic()
-    if now - _last_restore.get(name, -interval) < interval:
-        return None
-    _last_restore[name] = now
-    try:
-        if not await kv.store().rl_claim(f"rl:restore:{name}", interval):
-            return None  # another process restored it inside this interval
-    except kv.Unavailable:
-        return None
-    async with ratelimit_session_maker() as db:
-        version = await config_admin.restore(db)
-    log.warning("rate_limit_%s_restored %s", name, json.dumps(
-        {"event": f"rate_limit_{name}_restored", "version": version}, separators=(",", ":")))
-    metrics.count(f"{name}_restores")
-    return version
 
 
 async def emit() -> tuple[list[dict], dict]:
@@ -104,8 +78,7 @@ async def _forever(interval_s: float, step) -> None:
 
 
 async def config_step() -> None:
-    await config_state.refresh_once()
-    await maybe_restore("config")
+    await config_sync.poll_once()
 
 
 async def blocklist_step() -> None:
@@ -195,9 +168,23 @@ async def inflight_loop() -> None:
             log.exception("inflight gauge pass failed")
 
 
+async def lease_loop() -> None:
+    """Renew the leases of requests still in flight, well inside the lease TTL, so a stream that
+    outlives the TTL keeps counting. A request that ends releases its lease itself."""
+    while True:
+        ttl = config_state.current().config.concurrency_ttl_s
+        await asyncio.sleep(max(1.0, ttl / 3))
+        try:
+            await limiter().renew_leases()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a missed renewal only risks one undercount window
+            log.exception("rate limit lease renewal failed")
+
+
 async def run() -> None:
     tasks = [asyncio.create_task(loop())
-             for loop in (config_loop, blocklist_loop, maintenance_loop, inflight_loop)]
+             for loop in (config_loop, blocklist_loop, maintenance_loop, inflight_loop, lease_loop)]
     try:
         await asyncio.gather(*tasks)
     finally:
@@ -212,6 +199,5 @@ async def run() -> None:
 
 
 def reset_for_tests() -> None:
-    _last_restore.clear()
     signals_flush.reset_for_tests()
     blocklist_sync.reset_for_tests()

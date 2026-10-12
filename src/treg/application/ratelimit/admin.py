@@ -1,10 +1,10 @@
-"""Writing the rate-limit policy: Postgres first (the audited source of truth), then `rl:config`.
+"""Writing the rate-limit policy: Postgres (the audited source of truth), then the Redis cache.
 
 The only writer of `RateLimitConfigVersion`. Every write is range-checked before anything is
-stored, inserts one row, commits, and only then publishes to the shared store, so the store can
-never hold a version Postgres does not. A failed publish leaves the row committed and reports
-`published: false`; `republish` copies the newest row to the store again (also the remedy when
-an LRU-evicting store drops the key).
+stored, inserts one row (a new, higher version: `revert-to-shadow` too), commits, and only then
+copies it to `rl:config` with a compare-and-set that keeps the newer of the two. Serving
+processes read Postgres (`config_sync`), never the cache, so a failed, late or stale publish can
+never change what they serve. `republish` copies the newest row again.
 """
 
 from __future__ import annotations
@@ -48,18 +48,21 @@ async def _latest(db: AsyncSession) -> RateLimitConfigVersion | None:
     )).scalars().first()
 
 
-async def _publish(version: int, config: RateLimitConfig, *, actor: str, force: bool) -> bool:
+async def _publish(version: int, config: RateLimitConfig, *, actor: str) -> bool:
+    """Copy one Postgres version into the Redis cache. Compare-and-set in the store: written only
+    when `version` is newer than what it holds, so a slow or stale writer can never replace a
+    newer policy. Workers do not read this copy (they read Postgres); it is a cache for tools."""
     if not kv.configured():
         return False
     document = encode_document(version, config, written_by=actor)
     try:
-        stored = await kv.store().rl_publish(kv.RL_CONFIG_KEY, document, version, force=force)
+        held = await kv.store().rl_publish(kv.RL_CONFIG_KEY, document, version)
     except kv.Unavailable as exc:
         log.error("rate_limit_config_publish_failed version=%s error=%s", version, exc)
         return False
-    if not stored:
-        log.warning("rate_limit_config_publish_skipped version=%s (store holds a newer version)", version)
-    return stored
+    if held != version:
+        log.warning("rate_limit_config_publish_skipped version=%s held=%s (newer in the cache)", version, held)
+    return held == version
 
 
 async def _insert(db: AsyncSession, config: RateLimitConfig, *, actor: str, action: str, note: str,
@@ -79,7 +82,7 @@ async def _insert(db: AsyncSession, config: RateLimitConfig, *, actor: str, acti
     await db.commit()  # the audit row exists before the store can serve it; no session after this
     log.info("rate_limit_config_written version=%s action=%s mode=%s actor=%s",
              row.id, action, config.mode, actor)
-    out["published"] = await _publish(row.id, config, actor=actor, force=False)
+    out["published"] = await _publish(row.id, config, actor=actor)
     return out
 
 
@@ -109,25 +112,16 @@ async def revert_to_shadow(db: AsyncSession, *, actor: str, note: str = "") -> d
 
 
 async def republish(db: AsyncSession, *, actor: str) -> dict:
+    """Copy Postgres's newest version into the cache. Never forced: if a newer version reached
+    the cache meanwhile, this one is dropped."""
     latest = await _latest(db)
     if latest is None:
         raise NothingToPublish()
     out = _row_out(latest)
     config = RateLimitConfig.model_validate(latest.config)
     await db.commit()
-    out["published"] = await _publish(latest.id, config, actor=actor, force=True)
+    out["published"] = await _publish(latest.id, config, actor=actor)
     return out
-
-
-async def restore(db: AsyncSession) -> int | None:
-    """The background repair for an evicted `rl:config`: publish the newest row, never over a newer
-    document. Returns the version published, None when there is nothing to publish."""
-    latest = await _latest(db)
-    await db.commit()
-    if latest is None:
-        return None
-    config = RateLimitConfig.model_validate(latest.config)
-    return latest.id if await _publish(latest.id, config, actor="restore", force=False) else None
 
 
 async def history(db: AsyncSession) -> list[dict]:

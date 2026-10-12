@@ -27,31 +27,31 @@ class FakeRateLimitStore:
         if self.down:
             raise kv.Unavailable("ConnectionError")
 
-    async def rl_admit_global(self, member, cap, ttl_ms, enforce):
-        self._check("rl_admit_global")
+    async def rl_admit_key(self, key, member, cap, ttl_ms, enforce):
+        self._check("rl_admit_key")
         raise kv.Unavailable("no admission in the fake store")
 
-    async def rl_release(self, member):
-        self._check("rl_release")
+    async def rl_release_key(self, key, member):
+        self._check("rl_release_key")
+
+    async def rl_renew(self, key, members, ttl_ms):
+        self._check("rl_renew")
+        return 0
 
     async def rl_get(self, key):
         self._check(f"rl_get:{key}")
         return self.docs.get(key)
 
-    async def rl_publish(self, key, value, version, *, force=False):
+    async def rl_publish(self, key, value, version):
+        """Compare-and-set like the Lua script: only a strictly newer version is written."""
         self._check(f"rl_publish:{key}")
         held = self.docs.get(key)
-        if held and not force and json.loads(held).get("version", 0) > version:
-            return False
+        if held:
+            current = json.loads(held).get("version", 0)
+            if current >= version:
+                return current
         self.docs[key] = value
-        return True
-
-    async def rl_claim(self, key, ttl_s):
-        self._check("rl_claim")
-        if key in self.claims:
-            return False
-        self.claims.add(key)
-        return True
+        return version
 
     async def rl_heartbeat(self, key, value, ttl_s):
         self._check("rl_heartbeat")

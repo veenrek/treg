@@ -1,12 +1,13 @@
 ---
 title: Request admission — blocklist, overload cap, global ceiling, surge signals (batch 1)
-status: built; blocklist log_only, global ceiling shadow, overload cap off by default
+status: built; blocklist log_only, global ceiling off, overload cap off by default
 sources:
   - src/treg/domain/ratelimit/__init__.py
   - src/treg/domain/ratelimit/policy.py
   - src/treg/application/ratelimit/__init__.py
   - src/treg/application/ratelimit/limiter.py
   - src/treg/application/ratelimit/config_state.py
+  - src/treg/application/ratelimit/config_sync.py
   - src/treg/application/ratelimit/blocklist_state.py
   - src/treg/application/ratelimit/blocklist_sync.py
   - src/treg/application/ratelimit/background.py
@@ -31,6 +32,8 @@ sources:
   - tests/test_rate_limit_admin.py
   - tests/test_rate_limit_overload.py
   - tests/test_rate_limit_blocklist_sync.py
+  - tests/test_rate_limit_codex_review.py
+  - tests/test_rate_limit_redis.py
 related:
   - architecture/import-boundaries.md
   - architecture/money.md
@@ -43,7 +46,19 @@ A flood through many valid keys exhausts **in-flight concurrency** before reques
 no reverse proxy, so admission lives in the app, as the outermost middleware
 (`bootstrap_ratelimit.RateLimitMiddleware`, added last in `bootstrap.create_app`), before auth, any
 database session and money admission. Decisions are `application.ratelimit.limiter.RateLimiter`;
-rules are `domain.ratelimit.policy`. Per-key, per-org, tier and IP layers are a later batch.
+rules are `domain.ratelimit.policy`. Per-key, per-org and tier layers, and IP tightening, are a later batch.
+
+**Identity.** The caller is the one credential the route's auth honors
+(`request_scope.credential`: the Bearer on `/mcp`, `X-Treg-Token` elsewhere; MCP's `_bearer` uses
+the same helper), and it is known only once auth has accepted it: `access.require_member` publishes
+the hash of the credential it actually used and whether that credential pins its team. A pinned
+credential is cached by its hash alone, so no other header changes who the limiter sees; an
+unpinned identity token, whose team auth takes from `X-Treg-Org`, is cached by hash and that team.
+A request whose credential is not resolved (none, unknown, or rejected by auth) is unresolved.
+
+**Client IP.** The entry `rate_limit_proxy_hops` (default 1) from the right of `X-Forwarded-For`,
+the one the nearest proxy appended (`bootstrap_ratelimit.client_ip`); what the client wrote further
+left is never used. 0 hops means the TCP peer, for a deployment with no proxy in front.
 
 Order per request:
 
@@ -52,10 +67,9 @@ Order per request:
    `Retry-After`, `reason: overload_cap` (`X-Treg-Overload-Reason`), at once; it never queues. The
    permit is held until the app returns, which for ASGI is after the last streamed chunk, a client
    disconnect, an exception or a cancellation. Health checks and `/admin/*` are not counted. MCP
-   streams (`GET /mcp...`, or an `/mcp` request accepting `text/event-stream`) never take a main
-   permit: they have a separate `overload_cap_stream_size` semaphore, refused as
-   `overload_cap_stream`. Only `GET /mcp...` is a stream; an MCP POST takes a main permit even when
-   it accepts `text/event-stream`. treg's own in-process requests (an MCP tool's `/call/`) take no
+   streams (`GET /mcp...`) never take a main permit: they have a separate `overload_cap_stream_size`
+   semaphore, refused as `overload_cap_stream`. An MCP POST takes a main permit even when it
+   accepts `text/event-stream`. treg's own in-process requests (an MCP tool's `/call/`) take no
    permit and are not counted in flight: the outer request already holds one.
    Distinct from the database pool's `503 treg_saturated`. The size is provisional: measured
    busy-hour concurrency is above it, so it is set from `inflight_gauge` before the flag is on.
@@ -64,18 +78,29 @@ Order per request:
    checked out, peak and capacity) every `inflight_gauge_emit_s`, as a log line and a metric. Both
    peaks are true maxima for the window, not samples: in flight updates on every request, the pool
    peak on every checkout (`db.install_checkout_peaks`); both reset at each emit.
-2. **Blocklist by key hash**, before auth (SHA-256 of the presented token, the `ApiKey.key_hash`
-   spelling), and by org id when the key's org is already in the key cache.
-3. **Global concurrency ceiling** (below), last of the middleware's checks.
-4. **Blocklist by org id after auth**: the middleware puts `check_org` in the request's scope slot
+2. **Blocklist by key hash**, before auth (SHA-256 of the honored credential, the `ApiKey.key_hash`
+   spelling), and by org id when the credential's org is already in the key cache.
+3. **Unresolved requests**: a lease in the client IP's small bucket (`anonymous_ip_concurrency`).
+   Unset, it is counted and never refused; set, a full bucket is **429**
+   `treg_rl.anonymous_ip_concurrency`.
+4. **Global concurrency ceiling** (below), last of the middleware's checks.
+5. **Blocklist by org id after auth**: the middleware puts `check_org` in the request's scope slot
    and `access.require_member` calls it once it knows the org (`_refuse_blocked_org`), so a blocked
    org is refused even on a key's first request in a process. Auth publishes the key's org first,
    so from the key's next request the refusal comes from the key cache, before any session opens.
    The cache holds the key-to-org mapping, not the verdict: an unblock applies at the next sync.
    An MCP client's Bearer is cached through the alias its in-process `/call/` teaches.
 
-Every refusing layer has its own label: `overload_cap`, `treg_blocklist.key_hash`,
-`treg_blocklist.org_id`, `treg_rl.global_concurrency`.
+Every refusing layer has its own label: `overload_cap`, `overload_cap_stream`,
+`treg_blocklist.key_hash`, `treg_blocklist.org_id`, `treg_rl.anonymous_ip_concurrency`,
+`treg_rl.global_concurrency`.
+
+**Leases.** Both counting layers are sorted sets of request ids in the shared store (`kv._RL_ADMIT`),
+scored by their last renewal. The middleware releases them in a `finally` shielded from
+cancellation (anyio cancels every await in a cancelled scope, `finally` included), the background
+`lease_loop` renews every in-flight request's leases (`limiter.renew_leases`, `kv._RL_RENEW`) well
+inside `concurrency_ttl_s` so a long stream keeps counting, and a lease nobody renews ages out after
+the TTL: the backstop for a process that dies holding one.
 
 ## Blocklist
 
@@ -140,32 +165,32 @@ The window, per-call cap and write budget defaults are placeholders, to be set f
 Mode `off` (the env default, until the store's request-path latency is measured), `shadow` (logs
 `rate_limit_would_block`) or `enforce` (**429**, `Retry-After`). Each limiter store call has a
 `rate_limit_store_timeout_ms` budget; a slower answer is a miss.
-One Lua script (`kv._RL_ADMIT_GLOBAL`) over a sorted set of request ids scored by start time;
-entries older than `concurrency_ttl_s` (at least `call_timeout_s`) age out; the middleware's
-`finally` removes the request. `global_paid_reserve` slots are usable by paid orgs only
+`concurrency_ttl_s` is at least `call_timeout_s`. `global_paid_reserve` slots are usable by paid orgs only
 (`RateLimitConfig.global_cap`). A key not yet in the key cache (every key's first request after a
 deploy) is counted but never refused: refused before auth it would never be learned. The figure is
 unset by default; it comes from measured peak in-flight concurrency and p95 latency. A store fault
 fails open to `policy.LocalCeiling` per process, with a short cooldown.
 
-The key cache (`KeyCache`, `request_scope.key_id`) learns a key's org, paid status and age from
+The key cache (`KeyCache`) learns a credential's org, paid status and age from
 `access.require_member` when the middleware asks (`want_caller`), one indexed read per key per TTL.
 
 ## Policy
 
-`RateLimitConfig` (mode and the global figures; the blocklist's mode is on its own row). **Env** holds defaults (mode `off` or
-`shadow`). **Postgres** `RateLimitConfigVersion` is the audited
-source (`PUT /admin/rate-limit/config`, super-admin; range checked; `enforce` needs
-`enforce_approval`; `revert-to-shadow` is one audited action). **`rl:config`** is the copy processes
-read every `rate_limit_config_refresh_s` in the background. A bad, missing or unreadable value
-keeps the last good policy for at most `rate_limit_config_max_age_s`; past that `enforce` is served
-as `shadow` and `rate_limit_config_stale` alerts. With nothing good, env defaults serve and
-`rate_limit_config_env_fallback` alerts. Every version change is logged.
+`RateLimitConfig` (mode and the counting figures; the blocklist's mode is on its own row). **Env**
+holds defaults (mode `off` or `shadow`). **Postgres** `RateLimitConfigVersion` is the audited
+source and the only one processes serve from (`PUT /admin/rate-limit/config`, super-admin; range
+checked; `enforce` needs `enforce_approval`; `revert-to-shadow` writes a new, higher version). Every
+`rate_limit_config_refresh_s` each process reads the newest row on the `ratelimit` pool
+(`config_sync.poll_once`). A bad or unreadable policy keeps the last good one for at most
+`rate_limit_config_max_age_s`; past that `enforce` is served as `shadow` and
+`rate_limit_config_stale` alerts. With nothing good and Postgres unreadable, env defaults serve and
+`rate_limit_config_env_fallback` alerts; an empty table is simply the env defaults. Every version
+change is logged.
 
-**Eviction repair:** the store evicts by LRU. When `rl:config` is missing, `background.maybe_restore`
-republishes it from Postgres on the dedicated `ratelimit` pool, at most once per
-`rate_limit_republish_interval_s` across processes (a store claim). The request path never reads
-Postgres (import contract).
+**`rl:config`** is a cache for tools, never read by a serving process. Writes to it are a
+compare-and-set (`kv._RL_PUBLISH`): stored only when the incoming version is strictly newer, so a
+stale republish or a slow writer after a Redis restart can neither overwrite a newer policy nor be
+served. The request path never reads Postgres (import contract).
 
 ## Surge signals
 
@@ -174,11 +199,14 @@ call requests, unknown keys, 401/403/429/5xx, blocklist matches, distinct orgs a
 flight; bounded by `surge_max_subjects`. `signals_flush` writes one `SurgeSignal` row per subject
 per `surge_flush_s` on the `ratelimit` pool, with the org's `created_at` and paid total. Pruning past
 `surge_retention_days` is a separate transaction after the insert, at most hourly, with the attempt
-time recorded before the DELETE, so a failed prune never takes an insert batch with it. The client IP is the ASGI peer; the middleware never reads a forwarded-for header. `python -m
-treg` starts uvicorn with its defaults: `proxy_headers` on, `forwarded_allow_ips` from
-`FORWARDED_ALLOW_IPS` or loopback only. So a forwarded-for header is applied only from a trusted
-peer, and behind a load balancer whose address is not trusted the peer is that hop. Trusting
-exactly the platform's hop is a deployment setting (`FORWARDED_ALLOW_IPS`), never `*`.
+time recorded before the DELETE, so a failed prune never takes an insert batch with it. Signals
+record the same client IP the limiter uses. `rate_limit_proxy_hops` must equal the number of
+proxies that append to `X-Forwarded-For` (1 behind the platform's one proxy). 0 hops, for a
+deployment with nothing in front, uses the ASGI client address: a client can otherwise supply the
+only forwarded-for entry and pick its own bucket. `python -m treg` starts uvicorn with its
+defaults (`proxy_headers` on, `forwarded_allow_ips` from `FORWARDED_ALLOW_IPS` or loopback only),
+which may rewrite that address from a trusted peer; the limiter does not use that rewrite when
+hops is at least 1. Trusting every peer (`*`) is never the setting.
 
 ## Telemetry
 

@@ -123,12 +123,14 @@ agents then built against a constitution that was wrong.
   writes `callrecord`, domains only read it (`application/evidence_retention.py` also updates it,
   blanking the two evidence columns past retention).
 - **Request admission** is the outermost middleware (`bootstrap_ratelimit.py`), before auth, any
-  session and money admission: an in-process overload cap (off by default), the blocklist (by key
-  hash before auth, by org after; `log_only` by default) and a global concurrency ceiling (`shadow`
-  by default) that fails open when the shared store cannot answer. Its policy and blocklist are
-  written only by `application/ratelimit/admin.py` (audited table, then `rl:config`) and
-  `blocklist_admin.py` (Postgres only; processes poll its version and cache the entries); the
-  request path reads memory only. The env cannot refuse
+  session and money admission: an in-process overload cap (off by default), the blocklist (by the
+  one credential the route's auth honors, before any session; `log_only` by default), a small
+  per-IP bucket for a request whose credential is not resolved (the hop the nearest proxy appended,
+  never an entry the client wrote), and a global concurrency ceiling (`off` by default) that fails
+  open when the shared store cannot answer. Its policy and blocklist are written only by
+  `application/ratelimit/admin.py` and `blocklist_admin.py` to audited Postgres tables, which
+  serving processes poll in the background (Redis holds only lease counters and a version-guarded
+  policy cache nothing serves from); the request path reads memory only. The env cannot refuse
   requests; that needs an audited admin write. See `docs/context/architecture/rate-limit.md`.
 - **Feedback handling.** This repo owns `FeedbackHandling` and `FeedbackHandlingEvent` models and
   migrations; the private admin service is their only runtime writer. Original reports remain

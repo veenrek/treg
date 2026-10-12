@@ -10,7 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from treg import analytics
-from treg.application.ratelimit import background, config_state, limiter
+from treg.application.ratelimit import background, config_state, config_sync, limiter
 from treg.config import Settings, get_settings
 from treg.domain.ratelimit import RateLimitConfig
 from treg.infra import kv
@@ -81,130 +81,126 @@ def test_env_defaults_are_range_checked_at_boot(bad):
         Settings(**bad)
 
 
-async def test_a_valid_document_is_loaded_and_its_version_logged(monkeypatch, caplog):
-    store = install(monkeypatch)
-    store.docs[kv.RL_CONFIG_KEY] = _doc(3, global_concurrency=40, global_paid_reserve=10)
+async def _write(**update) -> int:
+    """A policy row, as the admin write path stores it."""
+    from treg.infra.db import session_maker
+    from treg.models import RateLimitConfigVersion
+    doc = get_settings().rate_limit_defaults.model_dump(mode="json")
+    doc.update(update)
+    async with session_maker() as db:
+        row = RateLimitConfigVersion(actor="t", action="set", mode=doc.get("mode", "?"), config=doc, note="n")
+        db.add(row)
+        await db.flush()
+        version = row.id
+        await db.commit()
+    return version
+
+
+async def test_a_valid_policy_is_loaded_from_postgres_and_its_version_logged(clients, caplog):
+    v = await _write(mode="shadow", global_concurrency=40, global_paid_reserve=10)
     caplog.set_level(logging.INFO, logger="treg.ratelimit")
-    state = await config_state.refresh_once()
-    assert (state.version, state.source, state.fallback, state.degraded) == (3, "store", False, False)
+    state = await config_sync.poll_once()
+    assert (state.version, state.source, state.fallback, state.degraded) == (v, "db", False, False)
     assert state.config.global_cap("unpaid") == 30
     change = _changes(caplog)[-1]
-    assert (change["version"], change["mode"]) == (3, "off")
+    assert (change["version"], change["mode"]) == (v, "shadow")
 
 
-async def test_the_version_is_logged_on_every_change_and_only_then(monkeypatch, caplog):
-    store = install(monkeypatch)
+async def test_the_version_is_logged_on_every_change_and_only_then(clients, caplog):
     caplog.set_level(logging.INFO, logger="treg.ratelimit")
-    store.docs[kv.RL_CONFIG_KEY] = _doc(3, mode="shadow")
-    await config_state.refresh_once()
-    await config_state.refresh_once()
-    store.docs[kv.RL_CONFIG_KEY] = _doc(4, mode="off")
-    await config_state.refresh_once()
-    loaded = [c for c in _changes(caplog) if c["source"] == "store"]
+    v1 = await _write(mode="shadow")
+    await config_sync.poll_once()
+    await config_sync.poll_once()
+    v2 = await _write(mode="off")
+    await config_sync.poll_once()
+    loaded = [c for c in _changes(caplog) if c["source"] == "db"]
     assert [(c["version"], c["mode"], c["previous_version"]) for c in loaded] == [
-        (3, "shadow", 0), (4, "off", 3)]
+        (v1, "shadow", 0), (v2, "off", v1)]
+
+
+async def test_workers_never_serve_the_redis_copy(clients, monkeypatch):
+    """Postgres is the source: a stale (or newer, foreign) document in Redis changes nothing."""
+    store = install(monkeypatch)
+    v = await _write(mode="shadow")
+    store.docs[kv.RL_CONFIG_KEY] = _doc(v + 50, mode="enforce", global_concurrency=1)
+    state = await config_sync.poll_once()
+    assert (state.version, state.config.mode) == (v, "shadow")
+    assert not [k for k in store.calls if k.startswith("rl_get")]
 
 
 @pytest.mark.parametrize("bad", [
-    "{not json",
-    json.dumps([1, 2]),
-    json.dumps({"version": 9, "config": {"mode": "shadow"}}),
-    json.dumps({"version": 9, "config": {"mode": "enforce", "surprise": 1}}),
-    json.dumps({"version": "9", "config": {}}),
-    json.dumps({"version": 0, "config": {}}),
+    {"mode": "loud"}, {"global_concurrency": 0}, {"concurrency_ttl_s": 30}, {"surprise": 1},
 ])
-async def test_a_bad_document_keeps_the_last_good_policy(monkeypatch, caplog, bad):
-    store = install(monkeypatch)
-    store.docs[kv.RL_CONFIG_KEY] = _doc(3, global_concurrency=40)
-    await config_state.refresh_once()
-    store.docs[kv.RL_CONFIG_KEY] = bad
+async def test_a_bad_policy_row_keeps_the_last_good_policy(clients, caplog, bad):
+    good = await _write(global_concurrency=40)
+    await config_sync.poll_once()
+    await _write(**bad)
     caplog.set_level(logging.WARNING, logger="treg.ratelimit")
-    state = await config_state.refresh_once()
-    assert (state.version, state.config.global_concurrency) == (3, 40)
+    state = await config_sync.poll_once()
+    assert (state.version, state.config.global_concurrency) == (good, 40)
     assert any(r.getMessage().startswith("rate_limit_config_kept") for r in caplog.records)
 
 
-async def test_an_out_of_range_value_in_the_store_keeps_the_last_good_policy(monkeypatch):
-    store = install(monkeypatch)
-    store.docs[kv.RL_CONFIG_KEY] = _doc(3)
-    await config_state.refresh_once()
-    doc = json.loads(_doc(4))
-    doc["config"]["global_concurrency"] = 0
-    store.docs[kv.RL_CONFIG_KEY] = json.dumps(doc)
-    assert (await config_state.refresh_once()).version == 3
-    store.docs[kv.RL_CONFIG_KEY] = _doc(5, concurrency_ttl_s=30)  # shorter than a request may last
-    assert (await config_state.refresh_once()).version == 3
-
-
-async def test_a_missing_document_keeps_the_last_good_policy_and_asks_for_a_restore(monkeypatch, alerts):
-    store = install(monkeypatch)
-    store.docs[kv.RL_CONFIG_KEY] = _doc(3)
-    await config_state.refresh_once()
-    del store.docs[kv.RL_CONFIG_KEY]
-    state = await config_state.refresh_once()
-    assert (state.version, state.source) == (3, "store")
-    assert config_state.missing()
+async def test_an_empty_table_means_the_env_defaults_without_an_alert(clients, alerts):
+    state = await config_sync.poll_once()
+    assert (state.version, state.source, state.fallback) == (0, "env", False)
     assert not alerts
 
 
-async def test_with_nothing_good_the_env_defaults_serve_and_alert(monkeypatch, caplog, alerts):
-    install(monkeypatch)
+def _db_down(monkeypatch):
+    def down():
+        raise ConnectionError("database unreachable")
+    monkeypatch.setattr(config_sync, "ratelimit_session_maker", down)
+
+
+async def test_with_nothing_good_and_postgres_down_the_env_defaults_serve_and_alert(clients, monkeypatch, caplog, alerts):
+    _db_down(monkeypatch)
     caplog.set_level(logging.ERROR, logger="treg.ratelimit")
-    state = await config_state.refresh_once()
+    state = await config_sync.poll_once()
     assert (state.version, state.source, state.fallback) == (0, "env", True)
     assert state.config == get_settings().rate_limit_defaults
     assert state.config.mode in ("off", "shadow")
     assert any(r.getMessage().startswith("rate_limit_config_env_fallback") and r.levelno == logging.ERROR
                for r in caplog.records)
-    assert alerts == [("ratelimit_config_env_fallback", {"reason": "missing", "mode": "off"})]
+    assert [e for e, _ in alerts] == ["ratelimit_config_env_fallback"]
     _, gauge = await background.emit()
     assert gauge["config_fallback"] is True and gauge["config_source"] == "env"
 
 
-async def test_store_down_keeps_the_cached_policy(monkeypatch, alerts):
-    store = install(monkeypatch)
-    store.docs[kv.RL_CONFIG_KEY] = _doc(3, global_concurrency=40)
-    await config_state.refresh_once()
-    store.down = True
-    state = await config_state.refresh_once()
-    assert (state.version, state.config.global_concurrency, state.fallback) == (3, 40, False)
-    assert config_state.counters()["config_store_errors"] == 1
+async def test_postgres_down_keeps_the_cached_policy(clients, monkeypatch, alerts):
+    v = await _write(global_concurrency=40)
+    await config_sync.poll_once()
+    _db_down(monkeypatch)
+    state = await config_sync.poll_once()
+    assert (state.version, state.config.global_concurrency, state.fallback) == (v, 40, False)
+    assert config_state.counters()["config_read_errors"] == 1
     assert not alerts
 
 
-async def test_past_the_max_age_an_enforcing_last_good_drops_to_shadow_and_alerts(monkeypatch, caplog, alerts):
-    store = install(monkeypatch)
+async def test_past_the_max_age_an_enforcing_last_good_drops_to_shadow_and_alerts(clients, monkeypatch, alerts):
     clock = [1_000.0]
     monkeypatch.setattr(config_state, "_clock", lambda: clock[0])
-    store.docs[kv.RL_CONFIG_KEY] = _doc(3, mode="enforce", global_concurrency=40)
-    assert (await config_state.refresh_once()).config.mode == "enforce"
-    store.down = True
+    v = await _write(mode="enforce", global_concurrency=40)
+    assert (await config_sync.poll_once()).config.mode == "enforce"
+    real = config_sync.ratelimit_session_maker
+    _db_down(monkeypatch)
     clock[0] += get_settings().rate_limit_config_max_age_s - 1
-    assert (await config_state.refresh_once()).config.mode == "enforce"  # still inside 30 minutes
+    assert (await config_sync.poll_once()).config.mode == "enforce"  # still inside the max age
     clock[0] += 2
-    caplog.set_level(logging.ERROR, logger="treg.ratelimit")
-    state = await config_state.refresh_once()
-    assert (state.version, state.config.mode, state.degraded) == (3, "shadow", True)
+    state = await config_sync.poll_once()
+    assert (state.version, state.config.mode, state.degraded) == (v, "shadow", True)
     assert state.config.global_concurrency == 40
-    stale = [e for e in alerts if e[0] == "ratelimit_config_stale"]
-    assert len(stale) == 1 and stale[0][1]["version"] == 3
-    await config_state.refresh_once()
-    assert len([e for e in alerts if e[0] == "ratelimit_config_stale"]) == 1  # alerts once
-    store.down = False
-    assert (await config_state.refresh_once()).config.mode == "enforce"  # a fresh read restores it
+    assert [e for e, _ in alerts].count("ratelimit_config_stale") == 1
+    await config_sync.poll_once()
+    assert [e for e, _ in alerts].count("ratelimit_config_stale") == 1  # alerts once
+    monkeypatch.setattr(config_sync, "ratelimit_session_maker", real)
+    assert (await config_sync.poll_once()).config.mode == "enforce"  # a fresh read restores it
 
 
-async def test_without_a_shared_store_the_env_policy_is_normal_not_an_alert(alerts):
-    state = await config_state.refresh_once()
-    assert (state.source, state.fallback) == ("env", False)
-    assert not alerts
-
-
-async def test_the_config_loop_refreshes_on_its_interval(monkeypatch):
+async def test_the_config_loop_reads_postgres_on_its_interval(clients, monkeypatch):
     monkeypatch.setenv("TREG_RATE_LIMIT_CONFIG_REFRESH_S", "7")
     get_settings.cache_clear()
-    store = install(monkeypatch)
-    store.docs[kv.RL_CONFIG_KEY] = _doc(5)
+    v = await _write()
     sleeps: list[float] = []
 
     async def fake_sleep(seconds):
@@ -216,8 +212,7 @@ async def test_the_config_loop_refreshes_on_its_interval(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await background.config_loop()
     assert sleeps == [7.0, 7.0, 7.0]
-    assert store.calls[f"rl_get:{kv.RL_CONFIG_KEY}"] == 3
-    assert config_state.current().version == 5
+    assert config_state.current().version == v
 
 
 async def test_a_slow_store_is_a_miss_within_the_budget(monkeypatch):
@@ -237,7 +232,7 @@ async def test_a_slow_store_is_a_miss_within_the_budget(monkeypatch):
     store._client = SlowClient()
     started = time.monotonic()
     with pytest.raises(kv.Unavailable):
-        await store.rl_admit_global("m", 5, 60_000, False)
+        await store.rl_admit_key(kv.RL_GLOBAL_KEY, "m", 5, 60_000, False)
     assert time.monotonic() - started < 0.2  # the 30 ms default budget, not the store's pace
     with pytest.raises(kv.Unavailable):
         await store.rl_get(kv.RL_CONFIG_KEY)

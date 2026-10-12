@@ -200,14 +200,23 @@ async def test_a_first_load_past_its_cap_falls_to_background_retry(clients, monk
 
 
 async def test_startup_makes_one_capped_attempt_and_goes_on_when_it_fails(monkeypatch):
+    from cryptography.fernet import Fernet
+
     from treg import bootstrap
     from treg.bootstrap import create_app
+    from treg.infra.db import reset_db
     calls = []
 
     async def fake_first_load():
         calls.append("first_load")
         return False  # the database is down: the worker must still start
 
+    # Lifespan verifies the schema before the first load. Postgres refuses to boot without a
+    # secret key; sqlite does not. Stamp the head either way so the test does not depend on
+    # whichever test ran before it.
+    monkeypatch.setenv("TREG_SECRET_KEY", Fernet.generate_key().decode())
+    get_settings.cache_clear()
+    await reset_db()
     monkeypatch.setattr(bootstrap.rate_limit_blocklist_sync, "first_load", fake_first_load)
     app = create_app("control")
     async with app.router.lifespan_context(app):

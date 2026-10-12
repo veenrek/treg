@@ -51,10 +51,11 @@ if redis.call('get', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
-# The global concurrency ceiling (domain/ratelimit/policy.py `LocalCeiling` is the in-process twin).
-# A sorted set of request ids scored by start time; entries older than the TTL age out, so a release
-# lost to a crash overcounts for at most that long. ARGV: member, ttl_ms, cap (-1 = none), enforce.
-_RL_ADMIT_GLOBAL = """
+# A concurrency lease set: the global ceiling or one client IP's bucket (domain/ratelimit/policy.py
+# `LocalCeiling` is the in-process twin). A sorted set of request ids scored by their last renewal;
+# entries older than the TTL age out, so a release lost to a crash overcounts for at most that
+# long. ARGV: member, ttl_ms, cap (-1 = none), enforce.
+_RL_ADMIT = """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local ttl = tonumber(ARGV[2])
@@ -69,17 +70,31 @@ if admitted then
 end
 return {admitted and 1 or 0, ok and 1 or 0, n}
 """
-# Overwrite a versioned document unless the stored one is newer (two admin writes racing).
+# Renew the leases of requests still running. XX never re-adds a lease that was released or aged
+# out. The last ARGV is the key's TTL in ms.
+_RL_RENEW = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local n = 0
+for i = 1, #ARGV - 1 do
+  n = n + redis.call('ZADD', KEYS[1], 'XX', 'CH', now, ARGV[i])
+end
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[#ARGV]))
+return n
+"""
+# A versioned cache document, written only when the incoming version is strictly newer than the
+# stored one. Returns the version the key holds afterwards.
 _RL_PUBLISH = """
+local incoming = tonumber(ARGV[2])
 local cur = redis.call('GET', KEYS[1])
-if cur and ARGV[3] ~= '1' then
+if cur then
   local ok, doc = pcall(cjson.decode, cur)
-  if ok and type(doc) == 'table' and tonumber(doc.version) and tonumber(doc.version) > tonumber(ARGV[2]) then
-    return 0
+  if ok and type(doc) == 'table' and tonumber(doc.version) and tonumber(doc.version) >= incoming then
+    return tonumber(doc.version)
   end
 end
 redis.call('SET', KEYS[1], ARGV[1])
-return 1
+return incoming
 """
 RL_CONFIG_KEY = "rl:config"
 RL_GLOBAL_KEY = "rl:g:c"
@@ -106,15 +121,16 @@ class Store(Protocol):
     async def release_lease(self, key: str, token: str) -> ReleaseResult: ...
 
     # Rate limiting raises `Unavailable` instead of answering for the store; see application/ratelimit.
-    async def rl_admit_global(self, member: str, cap: int | None, ttl_ms: int, enforce: bool) -> tuple[bool, bool, int]: ...
+    async def rl_admit_key(self, key: str, member: str, cap: int | None, ttl_ms: int,
+                           enforce: bool) -> tuple[bool, bool, int]: ...
 
-    async def rl_release(self, member: str) -> None: ...
+    async def rl_release_key(self, key: str, member: str) -> None: ...
+
+    async def rl_renew(self, key: str, members: list[str], ttl_ms: int) -> int: ...
 
     async def rl_get(self, key: str) -> str | None: ...
 
-    async def rl_publish(self, key: str, value: str, version: int, *, force: bool = False) -> bool: ...
-
-    async def rl_claim(self, key: str, ttl_s: int) -> bool: ...
+    async def rl_publish(self, key: str, value: str, version: int) -> int: ...
 
     async def rl_heartbeat(self, key: str, value: str, ttl_s: int) -> None: ...
 
@@ -161,20 +177,20 @@ class LocalStore:
     async def release_lease(self, key: str, token: str) -> ReleaseResult:
         return "unavailable"
 
-    # No shared store: the limiter runs per process on the env defaults, and has no blocklist.
-    async def rl_admit_global(self, member, cap, ttl_ms, enforce):
+    # No shared store: the limiter counts per process.
+    async def rl_admit_key(self, key, member, cap, ttl_ms, enforce):
         raise Unavailable("no shared store")
 
-    async def rl_release(self, member):
+    async def rl_release_key(self, key, member):
+        raise Unavailable("no shared store")
+
+    async def rl_renew(self, key, members, ttl_ms):
         raise Unavailable("no shared store")
 
     async def rl_get(self, key):
         raise Unavailable("no shared store")
 
-    async def rl_publish(self, key, value, version, *, force=False):
-        raise Unavailable("no shared store")
-
-    async def rl_claim(self, key, ttl_s):
+    async def rl_publish(self, key, value, version):
         raise Unavailable("no shared store")
 
     async def rl_heartbeat(self, key, value, ttl_s):
@@ -316,25 +332,26 @@ class RedisStore:
         except Exception as exc:  # noqa: BLE001 - cancellation still propagates
             raise Unavailable(type(exc).__name__) from exc
 
-    async def rl_admit_global(self, member: str, cap: int | None, ttl_ms: int,
-                              enforce: bool) -> tuple[bool, bool, int]:
+    async def rl_admit_key(self, key: str, member: str, cap: int | None, ttl_ms: int,
+                           enforce: bool) -> tuple[bool, bool, int]:
         admitted, ok, n = await self._rl(lambda: self._client.eval(
-            _RL_ADMIT_GLOBAL, 1, RL_GLOBAL_KEY, member, ttl_ms, -1 if cap is None else cap,
-            "1" if enforce else "0"))
+            _RL_ADMIT, 1, key, member, ttl_ms, -1 if cap is None else cap, "1" if enforce else "0"))
         return bool(admitted), bool(ok), int(n)
 
-    async def rl_release(self, member: str) -> None:
-        await self._rl(lambda: self._client.zrem(RL_GLOBAL_KEY, member))
+    async def rl_release_key(self, key: str, member: str) -> None:
+        await self._rl(lambda: self._client.zrem(key, member))
+
+    async def rl_renew(self, key: str, members: list[str], ttl_ms: int) -> int:
+        if not members:
+            return 0
+        return int(await self._rl(lambda: self._client.eval(_RL_RENEW, 1, key, *members, ttl_ms)))
 
     async def rl_get(self, key: str) -> str | None:
         return await self._rl(lambda: self._client.get(key))
 
-    async def rl_publish(self, key: str, value: str, version: int, *, force: bool = False) -> bool:
-        return bool(await self._rl(lambda: self._client.eval(
-            _RL_PUBLISH, 1, key, value, str(version), "1" if force else "0")))
-
-    async def rl_claim(self, key: str, ttl_s: int) -> bool:
-        return bool(await self._rl(lambda: self._client.set(key, "1", nx=True, ex=ttl_s)))
+    async def rl_publish(self, key: str, value: str, version: int) -> int:
+        """Write only if `version` is newer than the stored one; returns what the key now holds."""
+        return int(await self._rl(lambda: self._client.eval(_RL_PUBLISH, 1, key, value, str(version))))
 
     async def rl_heartbeat(self, key: str, value: str, ttl_s: int) -> None:
         await self._rl(lambda: self._client.set(key, value, ex=ttl_s))

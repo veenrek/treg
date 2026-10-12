@@ -181,7 +181,7 @@ async def test_after_a_redis_flush_a_stale_writer_is_never_served(clients, monke
     v2 = (await clients.post("/admin/rate-limit/config/revert-to-shadow", headers=h)).json()["version"]
     store.docs.clear()  # Redis restarted empty
     old = RateLimitConfig.model_validate(_policy(mode="enforce", global_concurrency=50))
-    await rl_admin._publish(1, old, actor="stale-writer", force=False)  # a slow writer lands late
+    await rl_admin._publish(1, old, actor="stale-writer")  # a slow writer lands late
     await _refresh()
     state = config_state.current()
     assert (state.version, state.config.mode) == (v2, "shadow")
@@ -244,7 +244,10 @@ async def test_a_cancelled_request_releases_its_slot_even_under_level_cancellati
 
 
 # ---- 5. a long-lived request keeps its slot past the lease TTL -------------------------------------
-async def test_a_long_lived_request_keeps_counting_past_the_lease_ttl(clients):
+async def test_a_long_lived_request_keeps_counting_past_the_lease_ttl(clients, monkeypatch):
+    monkeypatch.setenv("TREG_RATE_LIMIT_KEY_CACHE_TTL_S", "3600")  # the fake clock must not expire the key
+    get_settings.cache_clear()
+    limiter.reset_for_tests()
     cfg = use(mode="enforce", global_concurrency=1, concurrency_ttl_s=180)
     assert (await clients.get("/tools")).status_code == 200
     token = clients.headers["X-Treg-Token"]
@@ -259,6 +262,12 @@ async def test_a_long_lived_request_keeps_counting_past_the_lease_ttl(clients):
         clock[0] += 100
         await rl.renew_leases()
     assert await asyncio.wait_for(_call(mw, [("x-treg-token", token)]), 1) == 429  # still counted
+    # Without renewal the same wait would have aged the lease out: the TTL is still the backstop.
+    rl._live.clear()
+    clock[0] += 200
+    late = asyncio.create_task(_call(mw, [("x-treg-token", token)]))
+    await asyncio.sleep(0)
+    assert not late.done()  # admitted: the unrenewed lease aged out
     gate.release.set()
-    await stream
+    await asyncio.gather(stream, late)
     assert cfg.concurrency_ttl_s == 180

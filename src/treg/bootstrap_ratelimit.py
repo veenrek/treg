@@ -1,17 +1,20 @@
 """The outermost HTTP middleware: request admission before auth, the database or money.
 
-HTTP translation only; every decision is `application.ratelimit.limiter`. The client IP is the
-ASGI peer (`scope["client"]`, what the load balancer connection reports). A forwarded-for header
-is client-controlled and is never read here.
+HTTP translation only; every decision is `application.ratelimit.limiter`. The caller is the one
+credential the route's auth honors (`request_scope.credential`). The client IP is the entry the
+nearest proxy appended to X-Forwarded-For (`client_ip`); what the client wrote there is never used.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 
-from . import crypto
+import anyio
+from starlette.datastructures import Headers
+
 from .application.ratelimit import inflight, metrics
 from .application.ratelimit.limiter import RequestFacts, limiter
 from .config import get_settings
@@ -25,12 +28,23 @@ def _header(scope, name: bytes) -> str:
     return ""
 
 
-def _presented_token(scope) -> str:
-    token = _header(scope, b"x-treg-token")
-    if token:
-        return token
-    auth = _header(scope, b"authorization")
-    return auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+def client_ip(scope) -> str:
+    """The entry `rate_limit_proxy_hops` from the right of X-Forwarded-For: the one the nearest
+    proxy appended. Whatever the client wrote sits further left and is never used. With no proxy
+    (0 hops), or no usable entry, the TCP peer."""
+    client = scope.get("client")
+    peer = (client[0] if client else "") or "unknown"
+    hops = get_settings().rate_limit_proxy_hops
+    if hops <= 0:
+        return peer
+    values = [v.decode("latin-1") for k, v in scope.get("headers") or () if k.lower() == b"x-forwarded-for"]
+    entries = [e.strip() for e in ",".join(values).split(",") if e.strip()]
+    if len(entries) < hops:
+        return peer
+    try:
+        return str(ipaddress.ip_address(entries[-hops]))
+    except ValueError:
+        return peer
 
 
 def _server_credential(token: str) -> bool:
@@ -104,22 +118,21 @@ class RateLimitMiddleware:
         slot: dict = {}
         scope[request_scope.RATE_LIMIT] = slot
         internal = scope.get(request_scope.INTERNAL)
-        token = _presented_token(scope)
-        client = scope.get("client")
         path = scope.get("path", "")
+        token = request_scope.credential(path, Headers(scope=scope))  # what this route's auth honors
         trusted = bool(token and _server_credential(token))
         facts = RequestFacts(
-            ip=(client[0] if client else "") or "unknown",
+            ip=client_ip(scope),
             path=path,
-            key_id=request_scope.key_id(token, _header(scope, b"x-treg-org")) if token else None,
-            key_hash=crypto.hash_token(token) if token else None,
+            key_hash=request_scope.key_hash(token) if token else None,
+            org_header=_header(scope, b"x-treg-org"),
             alias=(internal or {}).get("alias") or None,
             exempt=bool(internal) or trusted or path in get_settings().rate_limit_exempt_path_set,
             trusted=trusted,
         )
         rl = limiter()
-        admission = await rl.admit(facts, slot)
         status = 500
+        admission = None
 
         async def tracked(message):
             nonlocal status
@@ -128,11 +141,16 @@ class RateLimitMiddleware:
             await send(message)
 
         try:
+            admission = await rl.admit(facts, slot)
             if admission.rejection is not None:
                 return await _reject(tracked, admission.rejection)
             await self.app(scope, receive, tracked)
         finally:
-            await rl.finish(admission, slot, status=status)
+            if admission is not None:
+                # Shielded: a cancelled request (anyio cancels every await in its scope, finally
+                # blocks included) must still give back its leases.
+                with anyio.CancelScope(shield=True):
+                    await rl.finish(admission, slot, status=status)
 
 
 class _Overloaded:

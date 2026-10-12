@@ -478,9 +478,8 @@ def _bearer(ctx: Context) -> str:
     Returns "" when absent — every authenticated tool then fails closed with an instruction rather
     than a stack trace, because a missing token is the single most likely first-run problem.
     """
-    headers = ctx.headers or {}
-    raw = headers.get("authorization") or headers.get("Authorization") or ""
-    return raw.removeprefix("Bearer ").removeprefix("bearer ").strip()
+    from .infra.request_scope import bearer_token  # the rate limiter reads the same credential
+    return bearer_token(ctx.headers or {})
 
 
 def _without_purchase_pointers(body: Any) -> Any:
