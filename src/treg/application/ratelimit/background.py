@@ -22,7 +22,7 @@ import time
 from ... import analytics
 from ...config import get_settings
 from ...infra import kv
-from ...infra.db import fold_pool_peaks, pool_snapshot, ratelimit_session_maker
+from ...infra.db import install_checkout_peaks, pool_snapshot, ratelimit_session_maker, take_checkout_peaks
 from ...infra.money_timing import PROCESS_INSTANCE
 from . import admin as config_admin
 from . import blocklist_admin, blocklist_state, config_state, inflight, metrics, receipts, signals_flush
@@ -139,23 +139,18 @@ async def maintenance_loop() -> None:
     await _forever(s.surge_flush_s, maintenance_step)
 
 
-_SAMPLE_S = 1.0
-
-
 class InflightGauge:
-    """Samples in-flight requests and DB pool checkouts every second (counter reads, no I/O) and
-    emits the window's peaks every `inflight_gauge_emit_s`. A failed pass is swallowed."""
+    """Emits the window's true peaks every `inflight_gauge_emit_s`: in flight is updated on every
+    request (`inflight.enter`), DB checkouts on every pool checkout (`install_checkout_peaks`); both
+    reset at each emit. No I/O; a failed pass is swallowed."""
 
     def __init__(self) -> None:
         self.opened = time.monotonic()
-        self.pool_peaks: dict[str, int] = {}
-
-    def sample(self) -> None:
-        fold_pool_peaks(self.pool_peaks, pool_snapshot())
+        install_checkout_peaks()
 
     def emit(self) -> dict:
         snapshot = pool_snapshot()
-        fold_pool_peaks(self.pool_peaks, snapshot)
+        peaks = take_checkout_peaks(snapshot)
         row = {
             "event": "inflight_gauge", "pid": os.getpid(), "process_instance": PROCESS_INSTANCE,
             "window_s": round(time.monotonic() - self.opened, 1),
@@ -163,10 +158,10 @@ class InflightGauge:
             "overload_cap_enabled": get_settings().overload_cap_enabled,
             "overload_cap_size": get_settings().overload_cap_size,
             **{f"db_{name}_checked_out": r["checked_out"] for name, r in snapshot.items()},
-            **{f"db_{name}_peak": self.pool_peaks.get(name, 0) for name in snapshot},
+            **{f"db_{name}_peak": peaks.get(name, 0) for name in snapshot},
             **{f"db_{name}_capacity": r["capacity"] for name, r in snapshot.items()},
         }
-        self.pool_peaks, self.opened = {}, time.monotonic()
+        self.opened = time.monotonic()
         log.info("inflight_gauge %s", json.dumps(row, separators=(",", ":")))
         analytics.capture(analytics.SERVER_DISTINCT_ID, "inflight_gauge",
                           {k: v for k, v in row.items() if k != "event"})
@@ -179,15 +174,13 @@ async def inflight_loop() -> None:
         return
     gauge = InflightGauge()
     while True:
+        await asyncio.sleep(s.inflight_gauge_emit_s)
         try:
-            gauge.sample()
-            if time.monotonic() - gauge.opened >= s.inflight_gauge_emit_s:
-                gauge.emit()
+            gauge.emit()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - telemetry never stops or fails anything
             log.exception("inflight gauge pass failed")
-        await asyncio.sleep(_SAMPLE_S)
 
 
 async def run() -> None:

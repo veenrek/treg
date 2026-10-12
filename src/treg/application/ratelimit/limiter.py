@@ -174,9 +174,10 @@ class RateLimiter:
         }, budget=get_settings().rate_limit_log_max_per_window, always=paid)
         if not enforce:
             return None
+        # Only the fixed code: the operator's reason text stays in the audit record, so a refused
+        # caller learns nothing about what was detected.
         return Rejection(403, ((b"x-treg-block-reason", reason.encode()),), {
-            "error": "blocked", "reason": reason, "message": entry.reason,
-            "blocklist_version": bl.version if bl else None,
+            "error": "blocked", "reason": reason, "blocklist_version": bl.version if bl else None,
         })
 
     # ---- the global ceiling -----------------------------------------------------------------

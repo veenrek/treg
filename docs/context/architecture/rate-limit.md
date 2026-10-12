@@ -52,13 +52,16 @@ Order per request:
    disconnect, an exception or a cancellation. Health checks and `/admin/*` are not counted. MCP
    streams (`GET /mcp...`, or an `/mcp` request accepting `text/event-stream`) never take a main
    permit: they have a separate `overload_cap_stream_size` semaphore, refused as
-   `overload_cap_stream`.
+   `overload_cap_stream`. Only `GET /mcp...` is a stream; an MCP POST takes a main permit even when
+   it accepts `text/event-stream`. treg's own in-process requests (an MCP tool's `/call/`) take no
+   permit and are not counted in flight: the outer request already holds one.
    Distinct from the database pool's `503 treg_saturated`. The size is provisional: measured
    busy-hour concurrency is above it, so it is set from `inflight_gauge` before the flag is on.
-   Every request is counted in flight (`inflight`) whether or not the cap is on;
-   `background.inflight_loop` samples that and the DB pools' checked-out connections every second
-   and emits `inflight_gauge` (pid, current and peak in flight, per-pool checked out, peak and
-   capacity) every `inflight_gauge_emit_s`, as a log line and a metric. Counter reads only.
+   Every external request is counted in flight (`inflight`) whether or not the cap is on.
+   `background.inflight_loop` emits `inflight_gauge` (pid, current and peak in flight, per-pool
+   checked out, peak and capacity) every `inflight_gauge_emit_s`, as a log line and a metric. Both
+   peaks are true maxima for the window, not samples: in flight updates on every request, the pool
+   peak on every checkout (`db.install_checkout_peaks`); both reset at each emit.
 2. **Blocklist by key hash**, before auth (SHA-256 of the presented token, the `ApiKey.key_hash`
    spelling), and by org id when the key's org is already in the key cache.
 3. **Global concurrency ceiling** (below), last of the middleware's checks.
@@ -75,8 +78,9 @@ Every refusing layer has its own label: `overload_cap`, `treg_blocklist.key_hash
 ## Blocklist
 
 Mode `blocklist_mode`: `off`, `log_only` (the default: match, log `rate_limit_blocklist_match`,
-serve), `enforce_403` (refuse with **403**, `X-Treg-Block-Reason`, the entry's reason and the
-blocklist version, so clients do not retry). The env accepts only `off` or `log_only`; `enforce_403`
+serve), `enforce_403` (refuse with **403**, `X-Treg-Block-Reason`, a body holding only the fixed
+reason code and the blocklist version, so clients do not retry; the operator's reason text stays in
+the audit record). The env accepts only `off` or `log_only`; `enforce_403`
 is an audited policy write.
 
 **Source of truth:** `BlocklistEntry` (one row per target, `expires_at` always set, `revoked_at` for
@@ -98,7 +102,8 @@ that does not parse or has an unknown `schema_version` keeps it too and alerts
 (`rate_limit_blocklist_invalid`). **Missing is never empty**: before a first good read a process has
 no list, reported as `blocklist_loaded: false`.
 
-**Writer:** `POST /admin/blocklist` (`blocklist_admin.block`), authorized by
+**Writer:** expected to move to treg-internal. Until then, every write route here is hard-off
+(404, before auth) unless its token is configured. `POST /admin/blocklist` (`blocklist_admin.block`), authorized by
 `blocklist_admin_token`, a credential that opens the blocklist and status endpoints only
 (`require_blocklist_writer`; a super-admin also passes). Guards, each a **400** naming the failure,
 and one bad target refuses the whole call:

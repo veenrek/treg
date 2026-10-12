@@ -169,7 +169,7 @@ async def test_mcp_streams_never_take_a_main_permit(capped):
     main = asyncio.create_task(_call(mw, "POST", "/call/x"))
     await asyncio.sleep(0)
     assert mw._overload.locked()  # the main cap (size 1) is full
-    stream = asyncio.create_task(_call(mw, "GET", "/mcp/"))
+    stream = asyncio.create_task(_call(mw, "GET", "/mcp/", MCP_ACCEPT))
     await asyncio.sleep(0)
     assert not stream.done() and mw._stream_cap.locked()  # admitted on its own cap
     status, sent = await _call(mw, "POST", "/call/y")
@@ -178,13 +178,15 @@ async def test_mcp_streams_never_take_a_main_permit(capped):
     await asyncio.gather(main, stream)
 
 
-@pytest.mark.parametrize("method,accept", [("GET", ""), ("POST", "application/json, text/event-stream")])
-async def test_a_full_stream_cap_refuses_streams_only(capped, method, accept):
+MCP_ACCEPT = "application/json, text/event-stream"  # what MCP clients send on every request
+
+
+async def test_a_full_stream_cap_refuses_streams_only(capped):
     hold = Hold()
     mw = RateLimitMiddleware(hold)
-    held = asyncio.create_task(_call(mw, "GET", "/mcp/v2/"))
+    held = asyncio.create_task(_call(mw, "GET", "/mcp/v2/", MCP_ACCEPT))
     await asyncio.sleep(0)
-    status, sent = await _call(mw, method, "/mcp/", accept)
+    status, sent = await _call(mw, "GET", "/mcp/", MCP_ACCEPT)
     assert status == 503
     assert json.loads(sent[1]["body"])["detail"]["reason"] == "overload_cap_stream"
     hold.release.set()
@@ -193,6 +195,38 @@ async def test_a_full_stream_cap_refuses_streams_only(capped, method, accept):
     hold.release.set()
     assert (await _call(mw, "POST", "/call/x"))[0] == 200  # the main cap was never touched
     assert mw._stream_cap._value == 1 and mw._overload._value == 1
+
+
+async def test_an_mcp_post_accepting_event_stream_takes_the_main_permit(capped):
+    hold = Hold()
+    mw = RateLimitMiddleware(hold)
+    held = asyncio.create_task(_call(mw, "POST", "/mcp/", MCP_ACCEPT))
+    await asyncio.sleep(0)
+    assert mw._overload.locked() and mw._stream_cap is None
+    status, sent = await _call(mw, "POST", "/mcp/", MCP_ACCEPT)
+    assert status == 503 and json.loads(sent[1]["body"])["detail"]["reason"] == "overload_cap"
+    hold.release.set()
+    await held
+
+
+async def test_an_mcp_tool_call_holds_one_permit_including_its_internal_call(capped):
+    """tools/call reaches /call/ through treg's own app in-process: that inner request must not
+    need a second main permit, or a cap of N would fit only N/2 MCP calls (and deadlock at 1)."""
+    inner_status: list[int] = []
+
+    async def downstream(scope, receive, send):
+        if scope["path"] == "/mcp/":
+            # The MCP tool forwards to /call/ in-process, while the outer request holds its permit.
+            inner = request_scope.internal_app(mw)
+            status, _ = await _call(inner, "POST", "/call/tool")
+            inner_status.append(status)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = RateLimitMiddleware(downstream)
+    status, _ = await _call(mw, "POST", "/mcp/", MCP_ACCEPT)
+    assert status == 200 and inner_status == [200]
+    assert mw._overload._value == 1
 
 
 async def test_a_plain_mcp_post_counts_in_the_main_cap(capped):
@@ -240,3 +274,23 @@ def test_uvicorn_trusts_forwarded_for_only_from_loopback_by_default(monkeypatch)
     asyncio.run(mw({"type": "http", "client": ("10.1.2.3", 5), "headers": headers}, None, None))
     asyncio.run(mw({"type": "http", "client": ("127.0.0.1", 5), "headers": headers}, None, None))
     assert seen == ["10.1.2.3", "203.0.113.9"]
+
+
+# ---- the 403 carries a fixed code only ----------------------------------------------------------
+async def test_the_blocklist_403_never_reveals_the_operators_reason(clients, monkeypatch):
+    from treg import crypto
+    _enforce_blocklist()
+    store = install(monkeypatch)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    secret_reason = "matched signup burst rule 7 from the surge query"
+    store.docs[kv.RL_BLOCKLIST_KEY] = json.dumps({
+        "schema_version": 1, "version": 3, "updated_at": expires,
+        "entries": [{"type": "key_hash", "value": crypto.hash_token(clients.headers["X-Treg-Token"]),
+                     "reason": secret_reason, "approved_by": "ops", "expires_at": expires}]})
+    await blocklist_state.refresh_once()
+    r = await clients.get("/tools")
+    assert r.status_code == 403
+    assert r.json() == {"detail": {"error": "blocked", "reason": "treg_blocklist.key_hash",
+                                   "blocklist_version": 3}}
+    assert secret_reason not in r.text and "ops" not in r.text
+    assert dict(r.headers)["x-treg-block-reason"] == "treg_blocklist.key_hash"

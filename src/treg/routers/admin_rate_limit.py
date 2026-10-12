@@ -1,7 +1,9 @@
 """Admin control of request admission: the policy, the blocklist, and what each process serves.
 
 Config writes need a super-admin. Blocklist writes also accept `blocklist_admin_token`, a credential
-that opens these endpoints and nothing else (docs/context/architecture/rate-limit.md).
+that opens these endpoints and nothing else (docs/context/architecture/rate-limit.md). Every write
+route is hard-off (404, before auth) until its token is configured: `blocklist_admin_token` for the
+blocklist, `admin_token` for the policy. The write API is expected to move to treg-internal.
 """
 
 from __future__ import annotations
@@ -21,6 +23,18 @@ from ..infra import kv
 from ..infra.db import get_admin_session
 
 router = APIRouter()
+
+
+def _blocklist_writes_on() -> None:
+    """Hard-off without a configured `blocklist_admin_token`: the route answers 404 before auth."""
+    if not get_settings().blocklist_admin_token:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _config_writes_on() -> None:
+    """Hard-off without a configured `admin_token`: the route answers 404 before auth."""
+    if not get_settings().admin_token:
+        raise HTTPException(status_code=404, detail="Not Found")
 
 
 class ConfigWrite(BaseModel):
@@ -78,7 +92,7 @@ async def admin_rate_limit_config(
             "this_process": background.process_status()}
 
 
-@router.put("/admin/rate-limit/config", include_in_schema=False)
+@router.put("/admin/rate-limit/config", include_in_schema=False, dependencies=[Depends(_config_writes_on)])
 async def admin_rate_limit_config_write(
     body: ConfigWrite, principal: str = Depends(require_superadmin),
     db: AsyncSession = Depends(get_admin_session),
@@ -94,7 +108,7 @@ async def admin_rate_limit_config_write(
                                                      "current_version": exc.current})
 
 
-@router.post("/admin/rate-limit/config/revert-to-shadow", include_in_schema=False)
+@router.post("/admin/rate-limit/config/revert-to-shadow", include_in_schema=False, dependencies=[Depends(_config_writes_on)])
 async def admin_rate_limit_revert_to_shadow(
     body: RevertIn | None = None, principal: str = Depends(require_superadmin),
     db: AsyncSession = Depends(get_admin_session),
@@ -102,7 +116,7 @@ async def admin_rate_limit_revert_to_shadow(
     return await rl_admin.revert_to_shadow(db, actor=principal, note=body.note if body else "")
 
 
-@router.post("/admin/rate-limit/config/republish", include_in_schema=False)
+@router.post("/admin/rate-limit/config/republish", include_in_schema=False, dependencies=[Depends(_config_writes_on)])
 async def admin_rate_limit_republish(
     principal: str = Depends(require_superadmin), db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
@@ -145,7 +159,7 @@ async def admin_blocklist_status(
     }
 
 
-@router.post("/admin/blocklist", include_in_schema=False)
+@router.post("/admin/blocklist", include_in_schema=False, dependencies=[Depends(_blocklist_writes_on)])
 async def admin_blocklist_block(
     body: BlockIn, principal: str = Depends(require_blocklist_writer),
     db: AsyncSession = Depends(get_admin_session),
@@ -165,7 +179,7 @@ async def admin_blocklist_block(
         raise HTTPException(status_code=400, detail={"error": "rejected", "errors": exc.errors})
 
 
-@router.post("/admin/blocklist/{entry_id}/unblock", include_in_schema=False)
+@router.post("/admin/blocklist/{entry_id}/unblock", include_in_schema=False, dependencies=[Depends(_blocklist_writes_on)])
 async def admin_blocklist_unblock(
     entry_id: int, body: UnblockIn, principal: str = Depends(require_blocklist_writer),
     db: AsyncSession = Depends(get_admin_session),

@@ -47,10 +47,10 @@ STREAM_OVERLOAD_REASON = "overload_cap_stream"
 
 
 def _mcp_stream(scope) -> bool:
+    """Only `GET /mcp...` is long-lived (the server-to-client stream). An MCP POST is one
+    exchange even when it accepts `text/event-stream`, so it takes a main permit."""
     path = scope.get("path", "")
-    if path != "/mcp" and not path.startswith("/mcp/"):
-        return False
-    return scope.get("method") == "GET" or "text/event-stream" in _header(scope, b"accept")
+    return scope.get("method") == "GET" and (path == "/mcp" or path.startswith("/mcp/"))
 
 
 def _overload_exempt(path: str) -> bool:
@@ -66,6 +66,10 @@ class RateLimitMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        if scope.get(request_scope.INTERNAL):
+            # treg calling itself (an MCP tool's /call/, a hub check): the outer request already
+            # holds this process's permit and is already counted in flight.
+            return await self._admit(scope, receive, send)
         inflight.enter()
         try:
             await self._capped(scope, receive, send)

@@ -229,15 +229,14 @@ async def test_in_flight_is_counted_with_the_cap_off_and_never_leaks(monkeypatch
 def test_the_gauge_emits_in_flight_and_db_pool_checkouts_tagged_with_the_pid(monkeypatch, caplog):
     import logging
     import os
+    from treg.infra import db as infra_db
     inflight.reset_for_tests()
     inflight.enter(); inflight.enter(); inflight.leave()
-    snapshots = iter([{"api": {"checked_out": 9, "capacity": 15}},
-                      {"api": {"checked_out": 4, "capacity": 15}}])
-    monkeypatch.setattr(background, "pool_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(background, "pool_snapshot", lambda: {"api": {"checked_out": 4, "capacity": 15}})
+    monkeypatch.setattr(infra_db, "_checkout_peaks", {"api": 9})  # what the checkout listener saw
     events: list = []
     monkeypatch.setattr(background.analytics, "capture", lambda _id, e, p=None, **_: events.append((e, p)))
     gauge = background.InflightGauge()
-    gauge.sample()
     caplog.set_level(logging.INFO, logger="treg.ratelimit")
     row = gauge.emit()
     assert (row["pid"], row["in_flight"], row["in_flight_peak"]) == (os.getpid(), 1, 2)
@@ -245,7 +244,38 @@ def test_the_gauge_emits_in_flight_and_db_pool_checkouts_tagged_with_the_pid(mon
     assert (row["overload_cap_enabled"], row["overload_cap_size"]) == (True, 2)  # this file's fixture
     assert events[0][0] == "inflight_gauge" and events[0][1]["pid"] == os.getpid()
     assert any(r.getMessage().startswith("inflight_gauge {") for r in caplog.records)
+    assert gauge.emit()["db_api_peak"] == 4  # reset at each emit, to what is still checked out
     inflight.leave()
+
+
+async def test_a_burst_shorter_than_any_interval_still_shows_in_the_peak(monkeypatch):
+    """The peak is updated on every request, not sampled: five requests that come and go between
+    two emits still report 5, and the next window starts from what is in flight then."""
+    monkeypatch.setenv("TREG_OVERLOAD_CAP_ENABLED", "false")  # counted whether the cap is on or not
+    get_settings.cache_clear()
+    monkeypatch.setattr(background, "pool_snapshot", lambda: {})
+    monkeypatch.setattr(background.analytics, "capture", lambda *a, **k: None)
+    inflight.reset_for_tests()
+    gauge = background.InflightGauge()
+    gate = Gate()
+    mw = RateLimitMiddleware(gate)
+    burst = [asyncio.create_task(_call(mw, "/call/x")) for _ in range(5)]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    gate.release.set()
+    await asyncio.gather(*burst)  # all done before any emit
+    assert inflight.current() == 0
+    row = gauge.emit()
+    assert (row["in_flight"], row["in_flight_peak"]) == (0, 5)
+    assert gauge.emit()["in_flight_peak"] == 0
+
+
+def test_the_db_checkout_peak_is_the_true_maximum_and_restarts_each_window(monkeypatch):
+    from treg.infra import db as infra_db
+    monkeypatch.setattr(infra_db, "_checkout_peaks", {})
+    infra_db._checkout_peaks["api"] = 12  # a burst of checkouts between emits
+    assert infra_db.take_checkout_peaks({"api": {"checked_out": 3, "capacity": 15}}) == {"api": 12}
+    assert infra_db.take_checkout_peaks({"api": {"checked_out": 3, "capacity": 15}}) == {"api": 3}
 
 
 async def test_a_broken_gauge_never_stops_or_fails_anything(monkeypatch):
@@ -253,6 +283,7 @@ async def test_a_broken_gauge_never_stops_or_fails_anything(monkeypatch):
         raise RuntimeError("pool introspection failed")
 
     monkeypatch.setattr(background, "pool_snapshot", broken)
+    monkeypatch.setattr(background, "install_checkout_peaks", lambda: None)
     sleeps: list = []
 
     async def fake_sleep(s):
@@ -263,7 +294,7 @@ async def test_a_broken_gauge_never_stops_or_fails_anything(monkeypatch):
     monkeypatch.setattr(background.asyncio, "sleep", fake_sleep)
     with pytest.raises(asyncio.CancelledError):
         await background.inflight_loop()
-    assert sleeps == [1.0, 1.0, 1.0]  # kept sampling through every failure
+    assert sleeps == [10.0, 10.0, 10.0]  # kept emitting through every failure
 
     async def ok(scope, receive, send):
         await send({"type": "http.response.start", "status": 200, "headers": []})

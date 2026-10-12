@@ -395,3 +395,35 @@ async def test_an_evicted_policy_is_restored_from_postgres(clients, store):
     assert (await config_state.refresh_once()).version == v
     assert await background.maybe_restore("config") == v
     assert (await config_state.refresh_once()).config.global_concurrency == 70
+
+
+# ---- hard-off write routes ----------------------------------------------------------------------
+WRITES = [("post", "/admin/blocklist", {"entries": [{"type": "org_id", "value": "1"}], "reason": "r",
+                                        "approved_by": "o", "evidence": {"q": 1}}),
+          ("post", "/admin/blocklist/1/unblock", {"approved_by": "o", "reason": "r"}),
+          ("put", "/admin/rate-limit/config", {"config": {}, "note": "x"}),
+          ("post", "/admin/rate-limit/config/revert-to-shadow", {}),
+          ("post", "/admin/rate-limit/config/republish", {})]
+
+
+@pytest.mark.parametrize("method,path,body", WRITES)
+async def test_write_routes_are_404_with_no_admin_token_configured(clients, store, monkeypatch, method, path, body):
+    monkeypatch.setenv("TREG_ADMIN_TOKEN", "")
+    monkeypatch.setenv("TREG_BLOCKLIST_ADMIN_TOKEN", "")
+    get_settings.cache_clear()
+    for headers in ({}, {"X-Treg-Token": ADMIN}, {"X-Treg-Token": BOT}):
+        r = await getattr(clients, method)(path, headers=headers, json=body)
+        assert r.status_code == 404, (path, headers, r.text)
+    assert not await _rows(BlocklistAudit) and not await _rows(RateLimitConfigVersion)
+
+
+async def test_each_write_family_needs_its_own_token(clients, store, slack, monkeypatch):
+    monkeypatch.setenv("TREG_BLOCKLIST_ADMIN_TOKEN", "")
+    get_settings.cache_clear()
+    org_id, _ = await _new_org(clients)
+    blocked = await clients.post("/admin/blocklist", headers={"X-Treg-Token": ADMIN}, json=_body(("org_id", str(org_id))))
+    assert blocked.status_code == 404  # no blocklist token: even a super-admin cannot write it
+    policy = await clients.put("/admin/rate-limit/config", headers={"X-Treg-Token": ADMIN},
+                               json={"config": _policy(), "note": "x"})
+    assert policy.status_code == 200
+    assert (await clients.get("/admin/blocklist", headers={"X-Treg-Token": ADMIN})).status_code == 200  # reads stay

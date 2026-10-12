@@ -216,6 +216,42 @@ def pool_snapshot() -> dict[str, dict[str, int]]:
     return out
 
 
+_checkout_peaks: dict[str, int] = {}
+_checkout_peaks_installed = False
+
+
+def install_checkout_peaks() -> None:
+    """Track each pool's true checked-out maximum: on every checkout, read the pool's count. One
+    counter read per checkout, no I/O; installed once per process."""
+    global _checkout_peaks_installed
+    if _checkout_peaks_installed:
+        return
+    _checkout_peaks_installed = True
+    for name, engine in zip(_POOL_NAMES, _engines):
+        if engine.dialect.name == "sqlite":
+            continue
+        pool = engine.sync_engine.pool
+
+        def on_checkout(*_, _name=name, _pool=pool):
+            try:
+                n = int(_pool.checkedout())
+                if n > _checkout_peaks.get(_name, 0):
+                    _checkout_peaks[_name] = n
+            except Exception:  # noqa: BLE001 - telemetry must not fail a checkout
+                pass
+
+        event.listen(engine.sync_engine, "checkout", on_checkout)
+
+
+def take_checkout_peaks(snapshot: dict[str, dict[str, int]]) -> dict[str, int]:
+    """Each pool's highest checked-out count since the last call, then restart every window at the
+    current count, so a connection held across windows still shows."""
+    peaks = {name: max(_checkout_peaks.get(name, 0), row["checked_out"]) for name, row in snapshot.items()}
+    for name, row in snapshot.items():
+        _checkout_peaks[name] = row["checked_out"]
+    return peaks
+
+
 def fold_pool_peaks(peaks: dict[str, int], snapshot: dict[str, dict[str, int]]) -> dict[str, int]:
     """Keep the per-pool maximum of `checked_out` seen across samples (the gauge's whole job)."""
     for name, row in snapshot.items():

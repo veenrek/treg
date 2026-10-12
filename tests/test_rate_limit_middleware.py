@@ -116,7 +116,7 @@ async def test_a_blocked_key_hash_is_refused_403_before_auth(clients, monkeypatc
     assert r.status_code == 403
     assert r.headers["x-treg-block-reason"] == "treg_blocklist.key_hash"
     assert r.json()["detail"] == {"error": "blocked", "reason": "treg_blocklist.key_hash",
-                                  "message": "flood from one IP", "blocklist_version": 5}
+                                  "blocklist_version": 5}
     assert limiter.limiter().cache.get(request_scope.key_id(_token(clients)), now=1e12) is None
 
 
