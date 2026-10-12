@@ -178,6 +178,10 @@ class Settings(BaseSettings):
     # `inflight_gauge` data below before the flag is turned on.
     overload_cap_enabled: bool = False
     overload_cap_size: int = Field(default=40, ge=1, le=10_000)
+    # MCP streams (GET /mcp..., or any /mcp request accepting text/event-stream) stay open for
+    # minutes, so they never take a main permit: they have this separate small cap (same flag),
+    # refused as `overload_cap_stream`. Also provisional.
+    overload_cap_stream_size: int = Field(default=8, ge=1, le=10_000)
     overload_cap_retry_after_s: int = Field(default=1, ge=1, le=60)
     # Per-process telemetry for sizing the cap: requests in flight and DB pool connections checked
     # out, sampled every second and emitted (log line + metric, tagged with the pid) every N seconds.

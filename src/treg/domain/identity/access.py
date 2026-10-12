@@ -325,9 +325,11 @@ async def require_member(
         if not (request.url.path.startswith("/call/") or request.method in ("GET", "HEAD", "OPTIONS")):
             raise HTTPException(status_code=403, detail=(
                 "this is a public demo team — its token can only call tools and read"))
-    _refuse_blocked_org(request, org)
+    # Publish first: a blocked org's key is then cached, so its next request is refused by the
+    # middleware before any session opens.
     if x_treg_token:
         await _publish_rate_limit_caller(request, org, db)
+    _refuse_blocked_org(request, org)
     await db.commit()
     managed_keys.touch(api_key)
     return Caller(membership=membership, user=user, org=org, api_key=api_key)

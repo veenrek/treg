@@ -43,6 +43,14 @@ def _server_credential(token: str) -> bool:
 
 
 OVERLOAD_REASON = "overload_cap"
+STREAM_OVERLOAD_REASON = "overload_cap_stream"
+
+
+def _mcp_stream(scope) -> bool:
+    path = scope.get("path", "")
+    if path != "/mcp" and not path.startswith("/mcp/"):
+        return False
+    return scope.get("method") == "GET" or "text/event-stream" in _header(scope, b"accept")
 
 
 def _overload_exempt(path: str) -> bool:
@@ -53,6 +61,7 @@ class RateLimitMiddleware:
     def __init__(self, app):
         self.app = app
         self._overload: asyncio.Semaphore | None = None
+        self._stream_cap: asyncio.Semaphore | None = None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -67,12 +76,18 @@ class RateLimitMiddleware:
         s = get_settings()
         if not s.overload_cap_enabled or _overload_exempt(scope.get("path", "")):
             return await self._admit(scope, receive, send)
-        if self._overload is None:
-            self._overload = asyncio.Semaphore(s.overload_cap_size)
-        sem = self._overload
+        stream = _mcp_stream(scope)
+        if stream:
+            if self._stream_cap is None:
+                self._stream_cap = asyncio.Semaphore(s.overload_cap_stream_size)
+            sem, reason = self._stream_cap, STREAM_OVERLOAD_REASON
+        else:
+            if self._overload is None:
+                self._overload = asyncio.Semaphore(s.overload_cap_size)
+            sem, reason = self._overload, OVERLOAD_REASON
         if sem.locked():  # full: refuse now, never wait for a permit
-            metrics.count("overload_rejects")
-            return await _reject(send, _Overloaded(s.overload_cap_retry_after_s))
+            metrics.count("overload_stream_rejects" if stream else "overload_rejects")
+            return await _reject(send, _Overloaded(s.overload_cap_retry_after_s, reason))
         await sem.acquire()  # cannot block: no await between locked() and here
         try:
             # A pure ASGI app returns only after the last body chunk (a stream included) is sent,
@@ -119,10 +134,10 @@ class RateLimitMiddleware:
 class _Overloaded:
     status = 503
 
-    def __init__(self, retry_after_s: int):
+    def __init__(self, retry_after_s: int, reason: str = OVERLOAD_REASON):
         self.headers = ((b"retry-after", str(retry_after_s).encode()),
-                        (b"x-treg-overload-reason", OVERLOAD_REASON.encode()))
-        self.detail = {"error": "overloaded", "reason": OVERLOAD_REASON, "retry_after_s": retry_after_s}
+                        (b"x-treg-overload-reason", reason.encode()))
+        self.detail = {"error": "overloaded", "reason": reason, "retry_after_s": retry_after_s}
 
 
 async def _reject(send, rejection) -> None:

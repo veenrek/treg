@@ -49,7 +49,10 @@ Order per request:
    `overload_cap_size`, no shared store. When it is full (`locked()`) the request gets **503**,
    `Retry-After`, `reason: overload_cap` (`X-Treg-Overload-Reason`), at once; it never queues. The
    permit is held until the app returns, which for ASGI is after the last streamed chunk, a client
-   disconnect, an exception or a cancellation. Health checks and `/admin/*` are not counted.
+   disconnect, an exception or a cancellation. Health checks and `/admin/*` are not counted. MCP
+   streams (`GET /mcp...`, or an `/mcp` request accepting `text/event-stream`) never take a main
+   permit: they have a separate `overload_cap_stream_size` semaphore, refused as
+   `overload_cap_stream`.
    Distinct from the database pool's `503 treg_saturated`. The size is provisional: measured
    busy-hour concurrency is above it, so it is set from `inflight_gauge` before the flag is on.
    Every request is counted in flight (`inflight`) whether or not the cap is on;
@@ -61,7 +64,10 @@ Order per request:
 3. **Global concurrency ceiling** (below), last of the middleware's checks.
 4. **Blocklist by org id after auth**: the middleware puts `check_org` in the request's scope slot
    and `access.require_member` calls it once it knows the org (`_refuse_blocked_org`), so a blocked
-   org is refused even on a key's first request in a process.
+   org is refused even on a key's first request in a process. Auth publishes the key's org first,
+   so from the key's next request the refusal comes from the key cache, before any session opens.
+   The cache holds the key-to-org mapping, not the verdict: an unblock applies at the next sync.
+   An MCP client's Bearer is cached through the alias its in-process `/call/` teaches.
 
 Every refusing layer has its own label: `overload_cap`, `treg_blocklist.key_hash`,
 `treg_blocklist.org_id`, `treg_rl.global_concurrency`.
@@ -153,7 +159,11 @@ Record-only. `signals` aggregates in process memory per IP, per org and per (IP,
 call requests, unknown keys, 401/403/429/5xx, blocklist matches, distinct orgs and keys, peak in
 flight; bounded by `surge_max_subjects`. `signals_flush` writes one `SurgeSignal` row per subject
 per `surge_flush_s` on the `ratelimit` pool, with the org's `created_at` and paid total, and prunes
-past `surge_retention_days`. The client IP is the ASGI peer; a forwarded-for header is never read.
+past `surge_retention_days`. The client IP is the ASGI peer; the middleware never reads a forwarded-for header. `python -m
+treg` starts uvicorn with its defaults: `proxy_headers` on, `forwarded_allow_ips` from
+`FORWARDED_ALLOW_IPS` or loopback only. So a forwarded-for header is applied only from a trusted
+peer, and behind a load balancer whose address is not trusted the peer is that hop. Trusting
+exactly the platform's hop is a deployment setting (`FORWARDED_ALLOW_IPS`), never `*`.
 
 ## Telemetry
 
