@@ -126,7 +126,8 @@ or mode reloads, and the reload reads version, mode and active entries in one st
 `rate_limit_blocklist_max_entries` is refused whole: the last good list stays and the process
 alerts. A failed poll keeps the cached list and alerts once per distinct failure
 (`rate_limit_blocklist_load_failed`). The request path reads the in-memory copy only
-(`blocklist_state`).
+(`blocklist_state`). Shutdown cancels the background loops between polls: the poll already in
+flight finishes and closes its session before the task ends (`background._finish`).
 
 **Startup:** each worker makes one first-load attempt capped at
 `rate_limit_blocklist_first_load_s` (`blocklist_sync.first_load`, one log line with pid and elapsed

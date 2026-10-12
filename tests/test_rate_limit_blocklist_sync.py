@@ -10,13 +10,13 @@ import time
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, select
 
 from treg import analytics
 from treg.application.ratelimit import background, blocklist_state, blocklist_sync, limiter
 from treg.config import get_settings
 from treg.infra import db as infra_db
-from treg.infra.db import session_maker
+from treg.infra.db import reset_db, session_maker
 from treg.models import BlocklistEntry, BlocklistVersion
 from treg.timeutil import utcnow_naive
 
@@ -252,6 +252,37 @@ async def test_version_mode_and_entries_come_from_one_snapshot(clients, monkeypa
     assert await blocklist_sync.poll_once()
     bl = blocklist_state.current()
     assert bl.version == 5 and bl.match("org_id", "42", now=0) is not None  # version and entries agree
+
+
+async def test_cancelling_the_background_loops_during_a_poll_returns(monkeypatch):
+    """Lifespan shutdown cancels the loops. The poll already inside a session must finish and close
+    it; tearing that close down never returns, and the worker would not shut down."""
+    await reset_db()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holding():
+        async with blocklist_sync.ratelimit_session_maker() as db:
+            await db.execute(select(BlocklistVersion.id).where(BlocklistVersion.id == 1))
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(blocklist_sync, "_poll", holding)
+    task = asyncio.create_task(background.run())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=3)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=3)
+            except (asyncio.CancelledError, TimeoutError):
+                pass
 
 
 def test_the_ratelimit_pool_has_a_statement_timeout(monkeypatch):

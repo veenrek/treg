@@ -7,7 +7,8 @@
 - `lease_loop`: renews the concurrency leases of requests still in flight.
 - `maintenance_loop`: flushes surge signals and emits the window's telemetry.
 
-A failed pass never ends a loop. Nothing here runs on the request path.
+A failed pass never ends a loop. Nothing here runs on the request path. Shutdown cancels a loop
+between passes: the pass already in flight finishes and closes its session first (`_finish`).
 """
 
 from __future__ import annotations
@@ -66,10 +67,28 @@ async def emit() -> tuple[list[dict], dict]:
     return rows, gauge
 
 
+async def _finish(awaitable):
+    """Await one pass, and if this task is cancelled, let that pass finish first.
+
+    Cancelling a poll while its session is closing deadlocks the sqlite driver's graceful close,
+    and the worker's lifespan then never returns. The pass is a short read; the cancellation is
+    taken at the sleep that follows.
+    """
+    task = asyncio.create_task(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(task)
+        except Exception:  # noqa: BLE001 - the pass already failed; shutdown still leaves
+            pass
+        raise
+
+
 async def _forever(interval_s: float, step) -> None:
     while True:
         try:
-            await step()
+            await _finish(step())
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - the limiter keeps its last good state
@@ -109,7 +128,7 @@ async def blocklist_loop() -> None:
     """Every refresh interval, or every couple of seconds while no list has loaded yet."""
     while True:
         try:
-            await blocklist_step()
+            await _finish(blocklist_step())
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - the limiter keeps its last good list
