@@ -399,7 +399,7 @@ async def test_concurrent_writes_each_get_their_own_version(clients, store, slac
 
 
 async def test_a_mode_change_is_its_own_audited_version(clients, store, slack):
-    r = await clients.post("/admin/blocklist/mode", headers=BOT_H,
+    r = await clients.post("/admin/blocklist/mode", headers={"X-Treg-Token": ADMIN},
                            json={"mode": "enforce_403", "approved_by": "ops-lead", "reason": "card 12 approved"})
     assert r.status_code == 200 and r.json()["version"] == 1
     [row] = await _rows(BlocklistVersion)
@@ -407,13 +407,13 @@ async def test_a_mode_change_is_its_own_audited_version(clients, store, slack):
     [audit] = await _rows(BlocklistAudit)
     assert (audit.action, audit.version, audit.approved_by) == ("mode", 1, "ops-lead")
     assert await blocklist_sync.poll_once() and blocklist_state.current().mode == "enforce_403"
-    bad = await clients.post("/admin/blocklist/mode", headers=BOT_H,
+    bad = await clients.post("/admin/blocklist/mode", headers={"X-Treg-Token": ADMIN},
                              json={"mode": "enforce", "approved_by": "o", "reason": "r"})
     assert bad.status_code == 400
 
 
 async def test_revert_to_shadow_also_puts_the_blocklist_back_to_log_only(clients, store, slack):
-    await clients.post("/admin/blocklist/mode", headers=BOT_H,
+    await clients.post("/admin/blocklist/mode", headers={"X-Treg-Token": ADMIN},
                        json={"mode": "enforce_403", "approved_by": "o", "reason": "r"})
     r = await clients.post("/admin/rate-limit/config/revert-to-shadow", headers={"X-Treg-Token": ADMIN},
                            json={"note": "paging"})
@@ -432,3 +432,35 @@ async def test_readback_is_not_live_while_a_process_misses_its_heartbeat(clients
     assert r["live"] is False  # one process still serves the older list
     del store.live["rl:live:other"]  # its heartbeat expired: not counted as serving
     assert (await clients.get(f"/admin/blocklist/status?version={version}", headers=BOT_H)).json()["live"] is True
+
+
+
+@pytest.mark.parametrize("mode", ["enforce_403", "off", "log_only"])
+async def test_the_blocklist_token_can_never_change_the_mode(clients, store, slack, mode):
+    """The bot token adds and removes entries; whether they refuse requests is a super-admin's call."""
+    r = await clients.post("/admin/blocklist/mode", headers=BOT_H,
+                           json={"mode": mode, "approved_by": "bot", "reason": "r"})
+    assert r.status_code == 403
+    [row] = await _rows(BlocklistVersion)
+    assert (row.version, row.mode) == (0, "log_only")
+    assert not await _rows(BlocklistAudit)
+    assert (await clients.post("/admin/blocklist", headers=BOT_H, json=_body(
+        ("org_id", str((await _new_org(clients))[0]))))).status_code == 200  # block still works
+
+
+@pytest.mark.parametrize("mode", ["enforce_403", "off", "log_only"])
+async def test_a_super_admin_can_set_every_mode(clients, store, slack, mode):
+    r = await clients.post("/admin/blocklist/mode", headers={"X-Treg-Token": ADMIN},
+                           json={"mode": mode, "approved_by": "ops-lead", "reason": "card approved"})
+    assert r.status_code == 200 and r.json()["mode"] == mode
+    [row] = await _rows(BlocklistVersion)
+    assert (row.version, row.mode) == (1, mode)
+
+
+async def test_the_mode_route_is_hard_off_without_the_admin_token(clients, store, monkeypatch):
+    monkeypatch.setenv("TREG_ADMIN_TOKEN", "")
+    get_settings.cache_clear()
+    for headers in ({"X-Treg-Token": BOT}, {"X-Treg-Token": ADMIN}):
+        r = await clients.post("/admin/blocklist/mode", headers=headers,
+                               json={"mode": "enforce_403", "approved_by": "o", "reason": "r"})
+        assert r.status_code == 404

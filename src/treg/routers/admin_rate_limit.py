@@ -1,9 +1,10 @@
 """Admin control of request admission: the policy, the blocklist, and what each process serves.
 
 Config writes need a super-admin. Blocklist writes also accept `blocklist_admin_token`, a credential
-that opens these endpoints and nothing else (docs/context/architecture/rate-limit.md). Every write
-route is hard-off (404, before auth) until its token is configured: `blocklist_admin_token` for the
-blocklist, `admin_token` for the policy. The write API is expected to move to treg-internal.
+that opens the block, unblock, list and status endpoints and nothing else
+(docs/context/architecture/rate-limit.md). The blocklist mode and the policy need a super-admin.
+Every write route is hard-off (404, before auth) until its token is configured:
+`blocklist_admin_token` for block and unblock, `admin_token` for the mode and the policy. The write API is expected to move to treg-internal.
 """
 
 from __future__ import annotations
@@ -198,12 +199,15 @@ async def admin_blocklist_unblock(
         raise HTTPException(status_code=404, detail="no such blocklist entry")
 
 
-@router.post("/admin/blocklist/mode", include_in_schema=False, dependencies=[Depends(_blocklist_writes_on)])
+@router.post("/admin/blocklist/mode", include_in_schema=False, dependencies=[Depends(_config_writes_on)])
 async def admin_blocklist_mode(
-    body: ModeIn, principal: str = Depends(require_blocklist_writer),
+    body: ModeIn, principal: str = Depends(require_superadmin),
     db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
-    """off | log_only | enforce_403, with version + 1 and an audit row in one transaction."""
+    """off | log_only | enforce_403, with version + 1 and an audit row in one transaction.
+    Super-admin only, for every target mode: the blocklist token can add and remove entries but
+    never decides whether they refuse requests. Hard-off, like the policy writes, without
+    `admin_token`."""
     try:
         return await blocklist_admin.set_mode(db, body.mode, actor=principal,
                                               approved_by=body.approved_by, reason=body.reason)

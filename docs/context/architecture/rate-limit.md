@@ -79,8 +79,8 @@ Every refusing layer has its own label: `overload_cap`, `treg_blocklist.key_hash
 
 ## Blocklist
 
-Mode (on the version row, set by `POST /admin/blocklist/mode`, and back to `log_only` by the
-policy's `revert-to-shadow`): `off`, `log_only` (the default: match, log
+Mode (on the version row, set by `POST /admin/blocklist/mode`, super-admin only for every target
+mode, and back to `log_only` by the policy's `revert-to-shadow`): `off`, `log_only` (the default: match, log
 `rate_limit_blocklist_match`, serve), `enforce_403` (refuse with **403**, `X-Treg-Block-Reason`, a body holding only the fixed
 reason code and the blocklist version, so clients do not retry; the operator's reason text stays in
 the audit record).
@@ -111,7 +111,8 @@ blocklist.
 
 **Writer:** expected to move to treg-internal. Until then, every write route here is hard-off
 (404, before auth) unless its token is configured. `POST /admin/blocklist` (`blocklist_admin.block`), authorized by
-`blocklist_admin_token`, a credential that opens the blocklist and status endpoints only
+`blocklist_admin_token`, a credential that opens the block, unblock, list and status endpoints only
+(never the mode)
 (`require_blocklist_writer`; a super-admin also passes). Guards, each a **400** naming the failure,
 and one bad target refuses the whole call:
 
