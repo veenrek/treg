@@ -35,7 +35,7 @@ from treg.domain.ratelimit import Caller, RateLimitConfig
 from treg.infra import kv, request_scope
 from treg.infra.db import session_maker
 from treg.models import CreditBlock, SurgeSignal
-from tests.fake_rate_limit_store import install
+from tests.fake_rate_limit_store import install, install_blocklist
 
 PEER = "127.0.0.1"  # what httpx's ASGITransport reports as the client
 VERSION = 42
@@ -62,21 +62,8 @@ def use(**update) -> RateLimitConfig:
     return cfg
 
 
-def _iso(delta_s: float) -> str:
-    return (datetime.now(timezone.utc) + timedelta(seconds=delta_s)).isoformat()
-
-
-def _blocklist(*entries, version: int = 5) -> str:
-    return json.dumps({"schema_version": 1, "version": version, "updated_at": _iso(0), "entries": [
-        {"type": kind, "value": value, "reason": "flood from one IP", "approved_by": "ops",
-         "expires_at": _iso(expires_in)} for kind, value, expires_in in entries]})
-
-
 async def _load_blocklist(monkeypatch, *entries, version: int = 5):
-    store = install(monkeypatch)
-    store.docs[kv.RL_BLOCKLIST_KEY] = _blocklist(*entries, version=version)
-    assert (await blocklist_state.refresh_once()).version == version
-    return store
+    return install_blocklist(*entries, version=version)
 
 
 def _token(client) -> str:
@@ -177,62 +164,9 @@ async def test_server_credentials_are_never_blocklisted(clients, monkeypatch):
     assert (await clients.get("/admin/kv", headers={"X-Treg-Token": "server-side-admin"})).status_code == 200
 
 
-async def test_store_down_keeps_the_last_good_blocklist(clients, monkeypatch):
-    use(blocklist_mode="enforce_403")
-    store = await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token(_token(clients)), 3600))
-    store.down = True
-    assert (await blocklist_state.refresh_once()).version == 5
-    assert (await clients.get("/tools")).status_code == 403
-    assert blocklist_state.counters()["blocklist_store_errors"] == 1
-
-
-@pytest.mark.parametrize("bad", ["{garbage", json.dumps({"schema_version": 2, "version": 9, "entries": []})])
-async def test_an_unparseable_or_unknown_schema_blocklist_keeps_the_last_good_and_alerts(
-        clients, monkeypatch, caplog, bad):
-    events: list = []
-    monkeypatch.setattr(analytics, "capture", lambda _id, event, props=None, **_: events.append(event))
-    use(blocklist_mode="enforce_403")
-    store = await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token(_token(clients)), 3600))
-    store.docs[kv.RL_BLOCKLIST_KEY] = bad
-    caplog.set_level(logging.ERROR, logger="treg.ratelimit")
-    assert (await blocklist_state.refresh_once()).version == 5
-    assert (await clients.get("/tools")).status_code == 403  # never read as empty
-    assert "ratelimit_blocklist_invalid" in events
-    assert any(r.getMessage().startswith("rate_limit_blocklist_invalid") for r in caplog.records)
-    assert blocklist_state.counters()["blocklist_invalid"] == 1
-
-
-async def test_a_missing_blocklist_is_never_read_as_empty(clients, monkeypatch):
-    use(blocklist_mode="enforce_403")
-    store = await _load_blocklist(monkeypatch, ("key_hash", crypto.hash_token(_token(clients)), 3600))
-    del store.docs[kv.RL_BLOCKLIST_KEY]
-    assert (await blocklist_state.refresh_once()).version == 5
-    assert blocklist_state.missing()
-    assert (await clients.get("/tools")).status_code == 403
-
-
-async def test_the_blocklist_loop_syncs_every_few_seconds_and_writes_a_heartbeat(monkeypatch):
-    store = install(monkeypatch)
-    store.docs[kv.RL_BLOCKLIST_KEY] = _blocklist(("org_id", "7", 3600), version=11)
-    sleeps: list[float] = []
-
-    async def fake_sleep(seconds):
-        sleeps.append(seconds)
-        if len(sleeps) == 2:
-            raise asyncio.CancelledError
-
-    monkeypatch.setattr(background.asyncio, "sleep", fake_sleep)
-    with pytest.raises(asyncio.CancelledError):
-        await background.blocklist_loop()
-    assert sleeps == [5.0, 5.0]
-    assert store.calls[f"rl_get:{kv.RL_BLOCKLIST_KEY}"] == 2
-    beat = json.loads(next(iter(store.live.values())))
-    assert (beat["blocklist_version"], beat["blocklist_entries"], beat["blocklist_mode"]) == (11, 1, "log_only")
-    assert {"config_version", "mode"} <= beat.keys()
-
-
 async def test_requests_never_read_the_policy_or_the_blocklist(clients, monkeypatch):
-    store = await _load_blocklist(monkeypatch, ("org_id", "999999", 3600))
+    await _load_blocklist(monkeypatch, ("org_id", "999999", 3600))
+    store = install(monkeypatch)
     store.docs[kv.RL_CONFIG_KEY] = config_state.encode_document(9, get_settings().rate_limit_defaults)
     await config_state.refresh_once()
     before = dict(store.calls)
@@ -240,6 +174,7 @@ async def test_requests_never_read_the_policy_or_the_blocklist(clients, monkeypa
         assert (await clients.get("/tools")).status_code == 200
     reads = {k: v - before.get(k, 0) for k, v in store.calls.items() if k.startswith("rl_get")}
     assert not any(reads.values())
+    assert blocklist_state.counters()["blocklist_reloads"] == 1  # only the install above
 
 
 # ---- the global ceiling ---------------------------------------------------------------------------

@@ -144,18 +144,17 @@ async def admin_blocklist_status(
     version: int | None = None, _: str = Depends(require_blocklist_writer),
     db: AsyncSession = Depends(get_admin_session),
 ) -> dict:
-    """The readback an operator tool polls after a write: `live` is true once the store and every
-    process with a fresh heartbeat serve at least `version`."""
+    """The readback an operator tool polls after a write: `live` is true once every process with a
+    fresh heartbeat serves at least `version` (Postgres is the only copy; there is nothing between)."""
     pg_version = (await blocklist_admin.listing(db))["version"]
-    store_version = await blocklist_admin.store_version()
     processes = await _live()
     want = pg_version if version is None else version
     serving = [p.get("blocklist_version") or 0 for p in processes]
     return {
-        "pg_version": pg_version, "store_version": store_version,
+        "pg_version": pg_version,
         "processes": [{k: p.get(k) for k in ("process_instance", "blocklist_version", "blocklist_entries",
                                               "blocklist_loaded", "blocklist_mode")} for p in processes],
-        "live": bool(serving) and (store_version or 0) >= want and min(serving) >= want,
+        "live": bool(serving) and min(serving) >= want,
     }
 
 

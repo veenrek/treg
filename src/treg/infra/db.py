@@ -157,6 +157,10 @@ def _new_engine(name: str, url: str | None = None):
             pool_pre_ping=True, pool_recycle=300, pool_timeout=5,
             pool_size=spec["pool_size"], max_overflow=spec["max_overflow"],
         )
+    if name == "ratelimit" and not is_sqlite:
+        # Background polls and flushes only: a slow statement is abandoned, never waited on.
+        timeout = str(get_settings().rate_limit_db_statement_timeout_ms)
+        kwargs["connect_args"] = {"server_settings": {"statement_timeout": timeout}}
     if name == "read" and not is_sqlite:
         # A guard against accidental writes, including when the URL points at a writable server.
         # Use a replica/read-only database role as the access boundary, not this session default.

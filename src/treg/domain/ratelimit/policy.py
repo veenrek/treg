@@ -6,18 +6,15 @@ Pure rules, no I/O. Batch 1 of the design (docs/context/architecture/rate-limit.
   check, and `global_paid_reserve` of its slots are usable by paid orgs only, so unpaid traffic is
   shed first. Its mode is `off`, `shadow` or `enforce`.
 - The **blocklist** refuses a key hash before auth and an org id after auth. Its entries come from
-  `rl:blocklist`, whose payload `parse_blocklist` validates; its mode is `off`, `log_only` or
-  `enforce_403`.
+  Postgres (`application.ratelimit.blocklist_sync`); its mode is `off`, `log_only` or `enforce_403`.
 """
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -34,8 +31,6 @@ BLOCKLIST_REASONS = {"key_hash": "treg_blocklist.key_hash", "org_id": "treg_bloc
 # Write-time sanity ceilings: a value past one of these is a typo, not a policy.
 MAX_GLOBAL_CONCURRENCY = 100_000
 MAX_TTL_S = 3_600
-BLOCKLIST_SCHEMA_VERSION = 1
-MAX_BLOCKLIST_ENTRIES = 10_000
 _KEY_HASH = re.compile(r"^[0-9a-f]{64}$")
 _ORG_ID = re.compile(r"^[1-9][0-9]{0,18}$")
 
@@ -145,29 +140,13 @@ class KeyCache:
         return len(self._rows)
 
 
-# ---- the blocklist contract (`rl:blocklist`) --------------------------------------------------
-class InvalidBlocklist(ValueError):
-    pass
-
-
+# ---- the blocklist ------------------------------------------------------------------------------
 def valid_entry_value(kind: str, value: str) -> bool:
     if kind == "key_hash":
         return bool(_KEY_HASH.fullmatch(value))
     if kind == "org_id":
         return bool(_ORG_ID.fullmatch(value))
     return False
-
-
-def _utc(raw: object, name: str) -> datetime:
-    if not isinstance(raw, str):
-        raise InvalidBlocklist(f"{name}: not a string")
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        raise InvalidBlocklist(f"{name}: not ISO 8601") from None
-    if parsed.tzinfo is None:
-        raise InvalidBlocklist(f"{name}: no UTC offset")
-    return parsed.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -201,43 +180,6 @@ class Blocklist:
 
     def active(self, *, now: float) -> int:
         return sum(1 for e in self._index.values() if e.expires_at > now)
-
-
-def parse_blocklist(raw: str) -> Blocklist:
-    """`rl:blocklist`, schema 1:
-    `{"schema_version": 1, "version": <int>, "updated_at": <ISO 8601 UTC>,
-      "entries": [{"type": "key_hash"|"org_id", "value": <sha256 hex|org id>, "reason": <text>,
-                   "expires_at": <ISO 8601 UTC>, "approved_by": <name>}]}`.
-    Anything else raises; a caller keeps its last good list, never an empty one."""
-    try:
-        doc = json.loads(raw)
-    except ValueError:
-        raise InvalidBlocklist("not JSON") from None
-    if not isinstance(doc, dict):
-        raise InvalidBlocklist("not an object")
-    if doc.get("schema_version") != BLOCKLIST_SCHEMA_VERSION:
-        raise InvalidBlocklist(f"unknown schema_version {doc.get('schema_version')!r}")
-    version = doc.get("version")
-    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
-        raise InvalidBlocklist("version: must be a positive integer")
-    updated_at = doc.get("updated_at")
-    _utc(updated_at, "updated_at")
-    entries = doc.get("entries")
-    if not isinstance(entries, list) or len(entries) > MAX_BLOCKLIST_ENTRIES:
-        raise InvalidBlocklist("entries: must be a list of at most %d" % MAX_BLOCKLIST_ENTRIES)
-    out = []
-    for i, e in enumerate(entries):
-        if not isinstance(e, dict):
-            raise InvalidBlocklist(f"entries[{i}]: not an object")
-        kind, value = e.get("type"), e.get("value")
-        if kind not in BLOCKLIST_REASONS or not isinstance(value, str) or not valid_entry_value(kind, value):
-            raise InvalidBlocklist(f"entries[{i}]: bad type or value")
-        reason, approver = e.get("reason"), e.get("approved_by")
-        if not isinstance(reason, str) or not isinstance(approver, str):
-            raise InvalidBlocklist(f"entries[{i}]: reason and approved_by must be strings")
-        expires = _utc(e.get("expires_at"), f"entries[{i}].expires_at").timestamp()
-        out.append(BlockEntry(kind, value, reason, expires, approver))
-    return Blocklist.build(version, updated_at, tuple(out))
 
 
 def retry_seconds(retry_ms: int) -> int:

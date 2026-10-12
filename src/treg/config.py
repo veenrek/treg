@@ -164,7 +164,13 @@ class Settings(BaseSettings):
     rate_limit_config_refresh_s: float = Field(default=15.0, ge=1, le=300)
     # Past this without a fresh read of `rl:config`, the process drops to shadow and alerts.
     rate_limit_config_max_age_s: float = Field(default=1800.0, ge=60, le=86_400)
-    rate_limit_blocklist_refresh_s: float = Field(default=5.0, ge=5, le=10)
+    # Each worker polls the single-row blocklist version this often, reloading entries on a change.
+    rate_limit_blocklist_refresh_s: float = Field(default=10.0, ge=10, le=300)
+    # At startup the first blocklist load is retried this long before the app reports ready;
+    # after that the process fails open and keeps retrying in the background.
+    rate_limit_blocklist_cold_start_s: float = Field(default=30.0, ge=0, le=120)
+    # statement_timeout on the dedicated `ratelimit` pool (Postgres only).
+    rate_limit_db_statement_timeout_ms: int = Field(default=2000, ge=100, le=30_000)
     # A missing `rl:config` / `rl:blocklist` is restored from Postgres at most this often, fleet-wide.
     rate_limit_republish_interval_s: int = Field(default=60, ge=60, le=3600)
     rate_limit_key_cache_ttl_s: float = Field(default=60.0, ge=1, le=3600)

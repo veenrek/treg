@@ -4,10 +4,10 @@ Revision ID: 0070
 Revises: 0069
 Create Date: 2026-10-12
 
-Four new tables (docs/context/architecture/rate-limit.md): `ratelimitconfigversion` (one audited
-row per policy write), `blocklistentry` and `blocklistaudit` (the source of truth `rl:blocklist`
-is published from; an audit id is the published version), and `surgesignal` (record-only
-per-minute request aggregates). Additive only: four new tables, no change to an existing table.
+Five new tables (docs/context/architecture/rate-limit.md): `ratelimitconfigversion` (one audited
+row per policy write), `blocklistentry`, `blocklistaudit` and the single-row `blocklistversion`
+(the blocklist itself; processes poll the version and cache the entries), and `surgesignal`
+(record-only per-minute request aggregates). Additive only: new tables, no change to an existing table.
 Follows 0069 (platform key slots), which lands first.
 """
 from collections.abc import Sequence
@@ -65,6 +65,12 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(), nullable=False),
     )
     op.create_table(
+        "blocklistversion",
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=False),
+        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+    )
+    op.create_table(
         "surgesignal",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("window_start", sa.DateTime(), nullable=False),
@@ -94,6 +100,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("surgesignal")
+    op.drop_table("blocklistversion")
     op.drop_table("blocklistaudit")
     op.drop_table("blocklistentry")
     op.drop_table("ratelimitconfigversion")

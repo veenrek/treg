@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 
 import pytest
 from pydantic import ValidationError
@@ -11,12 +10,12 @@ from treg.config import get_settings
 from treg.domain.ratelimit import (
     BLOCKLIST_REASONS,
     GLOBAL_REASON,
+    BlockEntry,
+    Blocklist,
     Caller,
-    InvalidBlocklist,
     KeyCache,
     LocalCeiling,
     RateLimitConfig,
-    parse_blocklist,
 )
 
 KEY = "a" * 64
@@ -26,16 +25,6 @@ def _config(**update) -> RateLimitConfig:
     base = get_settings().rate_limit_defaults.model_dump(mode="json")
     base.update(update)
     return RateLimitConfig.model_validate(base)
-
-
-def _payload(**update) -> str:
-    doc = {"schema_version": 1, "version": 7, "updated_at": "2026-10-12T09:00:00Z",
-           "entries": [{"type": "key_hash", "value": KEY, "reason": "flood", "approved_by": "ops",
-                        "expires_at": "2099-01-01T00:00:00Z"},
-                       {"type": "org_id", "value": "42", "reason": "flood", "approved_by": "ops",
-                        "expires_at": "2000-01-01T00:00:00Z"}]}
-    doc.update(update)
-    return json.dumps(doc)
 
 
 @pytest.mark.parametrize("bad", [
@@ -113,31 +102,13 @@ def test_key_cache_expires_and_is_bounded():
     assert cache.get("b", now=61) is None
 
 
-def test_blocklist_payload_parses_and_expired_entries_stop_matching():
-    bl = parse_blocklist(_payload())
+def test_expired_entries_stop_matching():
+    bl = Blocklist.build(7, "2026-10-12T09:00:00Z", (
+        BlockEntry("key_hash", KEY, "flood", 4_000_000_000, "ops"),
+        BlockEntry("org_id", "42", "flood", 946_684_800, "ops"),  # expired in 2000
+    ))
     assert bl.version == 7
     assert bl.match("key_hash", KEY, now=0).reason == "flood"
-    assert bl.match("org_id", "42", now=2_000_000_000) is None  # expired in 2000
+    assert bl.match("org_id", "42", now=2_000_000_000) is None
     assert bl.match("org_id", "43", now=0) is None
     assert bl.active(now=2_000_000_000) == 1
-
-
-@pytest.mark.parametrize("raw", [
-    "{nope",
-    json.dumps([]),
-    _payload(schema_version=2),
-    _payload(schema_version=None),
-    _payload(version=0),
-    _payload(version="7"),
-    _payload(updated_at="yesterday"),
-    _payload(entries="all"),
-    _payload(entries=[{"type": "ip", "value": "1.2.3.4", "reason": "x", "approved_by": "o",
-                       "expires_at": "2099-01-01T00:00:00Z"}]),
-    _payload(entries=[{"type": "key_hash", "value": "short", "reason": "x", "approved_by": "o",
-                       "expires_at": "2099-01-01T00:00:00Z"}]),
-    _payload(entries=[{"type": "org_id", "value": "42", "reason": "x", "approved_by": "o",
-                       "expires_at": "2099-01-01T00:00:00"}]),  # no UTC offset
-])
-def test_a_bad_or_unknown_blocklist_payload_is_refused_not_read_as_empty(raw):
-    with pytest.raises(InvalidBlocklist):
-        parse_blocklist(raw)

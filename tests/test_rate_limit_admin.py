@@ -15,6 +15,7 @@ from treg import crypto
 from treg.application.ratelimit import (
     background,
     blocklist_state,
+    blocklist_sync,
     config_state,
     limiter,
     metrics,
@@ -23,7 +24,7 @@ from treg.application.ratelimit import (
 from treg.config import get_settings
 from treg.infra import kv, request_scope
 from treg.infra.db import session_maker
-from treg.models import BlocklistAudit, BlocklistEntry, CreditBlock, Org, RateLimitConfigVersion
+from treg.models import BlocklistAudit, BlocklistEntry, BlocklistVersion, CreditBlock, Org, RateLimitConfigVersion
 from treg.timeutil import utcnow_naive
 from tests.fake_rate_limit_store import install
 
@@ -115,16 +116,18 @@ async def test_an_unpaid_new_org_is_accepted_with_one_audit_row_and_a_receipt(cl
     r = await clients.post("/admin/blocklist", headers=BOT_H, json=_body(("org_id", str(org_id))))
     assert r.status_code == 200, r.text
     out = r.json()
-    assert out["published"] is True and out["ttl_s"] == 86_400
+    assert out["ttl_s"] == 86_400
     [entry] = out["entries"]
     assert entry["value"] == str(org_id) and entry["approved_by"] == "ops-lead"
     audits = await _rows(BlocklistAudit)
     assert len(audits) == 1 and audits[0].id == out["audit_id"] == out["version"]
     assert audits[0].entry_ids == [entry["id"]] and audits[0].actor == "blocklist-token"
     assert audits[0].evidence["query"].startswith("select")
-    doc = json.loads(store.docs[kv.RL_BLOCKLIST_KEY])
-    assert doc["schema_version"] == 1 and doc["version"] == out["version"]
-    assert doc["entries"][0]["type"] == "org_id" and doc["entries"][0]["value"] == str(org_id)
+    [version] = await _rows(BlocklistVersion)
+    assert version.version == out["version"]
+    assert kv.RL_CONFIG_KEY not in store.docs and not [k for k in store.docs if "blocklist" in k]  # Redis holds no blocklist
+    assert await blocklist_sync.poll_once()
+    assert blocklist_state.current().match("org_id", str(org_id), now=0) is not None
     await receipts.drain()
     [(token, channel, text)] = slack
     assert (token, channel) == ("xoxb-test", "U-OPS")
@@ -139,7 +142,7 @@ async def test_a_paid_org_is_rejected(clients, store, slack):
     assert r.status_code == 400
     assert any("has paid" in e for e in r.json()["detail"]["errors"])
     assert not await _rows(BlocklistEntry) and not await _rows(BlocklistAudit)
-    assert kv.RL_BLOCKLIST_KEY not in store.docs and not slack
+    assert not await _rows(BlocklistVersion) and not slack
 
 
 async def test_an_old_org_is_rejected(clients, store, slack):
@@ -217,41 +220,6 @@ async def test_the_endpoint_is_rate_limited(clients, store, slack, monkeypatch):
     assert codes == [200, 200, 429]
 
 
-# ---- write order, receipt, unblock, readback ------------------------------------------------------
-async def test_postgres_commits_before_the_store_is_written(clients, store, slack, monkeypatch):
-    org_id, _ = await _new_org(clients)
-    seen: list[int] = []
-    real = store.rl_publish
-
-    async def publish(key, value, version, *, force=False):
-        async with session_maker() as db:  # a separate session sees only committed rows
-            seen.append(len((await db.execute(select(BlocklistAudit))).scalars().all()))
-        return await real(key, value, version, force=force)
-
-    monkeypatch.setattr(store, "rl_publish", publish)
-    assert (await clients.post("/admin/blocklist", headers=BOT_H, json=_body(("org_id", str(org_id))))).status_code == 200
-    assert seen == [1]
-
-
-async def test_a_failed_publish_keeps_the_write_and_says_so(clients, store, slack):
-    org_id, _ = await _new_org(clients)
-    store.down = True
-    store.windows.clear()
-    real_take = store.take
-
-    async def take(key, limit, ttl_s):  # the write budget answers; only the publish fails
-        store.down = False
-        try:
-            return await real_take(key, limit, ttl_s)
-        finally:
-            store.down = True
-
-    store.take = take
-    r = await clients.post("/admin/blocklist", headers=BOT_H, json=_body(("org_id", str(org_id))))
-    assert r.status_code == 200 and r.json()["published"] is False
-    assert len(await _rows(BlocklistEntry)) == 1
-
-
 async def test_a_failing_receipt_never_undoes_or_delays_the_write(clients, store, monkeypatch):
     org_id, _ = await _new_org(clients)
     metrics.drain()
@@ -289,7 +257,8 @@ async def test_unblock_is_one_action_and_republishes(clients, store, slack):
                            json={"approved_by": "ops-lead", "reason": "false positive"})
     assert r.status_code == 200
     assert r.json()["version"] > blocked["version"]
-    assert json.loads(store.docs[kv.RL_BLOCKLIST_KEY])["entries"] == []
+    assert (await _rows(BlocklistVersion))[0].version == r.json()["version"]
+    assert await blocklist_sync.poll_once() and blocklist_state.current().active(now=0) == 0
     audits = await _rows(BlocklistAudit)
     assert [a.action for a in audits] == ["block", "unblock"]
     assert (await clients.get("/admin/blocklist", headers=BOT_H)).json()["entries"] == []
@@ -303,7 +272,7 @@ async def test_the_version_readback_is_live_only_once_every_process_serves_it(cl
     org_id, _ = await _new_org(clients)
     version = (await clients.post("/admin/blocklist", headers=BOT_H, json=_body(("org_id", str(org_id))))).json()["version"]
     before = (await clients.get(f"/admin/blocklist/status?version={version}", headers=BOT_H)).json()
-    assert before["pg_version"] == before["store_version"] == version
+    assert before["pg_version"] == version
     assert before["live"] is False  # no process has loaded it yet
     await background.blocklist_step()
     after = (await clients.get(f"/admin/blocklist/status?version={version}", headers=BOT_H)).json()
@@ -312,22 +281,6 @@ async def test_the_version_readback_is_live_only_once_every_process_serves_it(cl
     assert after["processes"][0]["blocklist_entries"] == 1
     status = (await clients.get("/admin/rate-limit/status", headers=BOT_H)).json()
     assert {"config_version", "mode", "blocklist_version", "blocklist_mode"} <= status["processes"][0].keys()
-
-
-async def test_an_evicted_blocklist_is_restored_from_postgres_at_most_once_per_interval(clients, store, slack):
-    org_id, _ = await _new_org(clients)
-    version = (await clients.post("/admin/blocklist", headers=BOT_H, json=_body(("org_id", str(org_id))))).json()["version"]
-    await blocklist_state.refresh_once()
-    del store.docs[kv.RL_BLOCKLIST_KEY]  # allkeys_lru evicted it
-    await blocklist_state.refresh_once()
-    assert blocklist_state.current().version == version  # missing is not empty
-    assert await background.maybe_restore("blocklist") == version
-    assert json.loads(store.docs[kv.RL_BLOCKLIST_KEY])["version"] == version
-    del store.docs[kv.RL_BLOCKLIST_KEY]
-    await blocklist_state.refresh_once()
-    assert await background.maybe_restore("blocklist") is None  # this minute's restore is spent
-    background.reset_for_tests()
-    assert await background.maybe_restore("blocklist") is None  # and another process's claim holds
 
 
 # ---- the policy ---------------------------------------------------------------------------------
@@ -427,3 +380,27 @@ async def test_each_write_family_needs_its_own_token(clients, store, slack, monk
                                json={"config": _policy(), "note": "x"})
     assert policy.status_code == 200
     assert (await clients.get("/admin/blocklist", headers={"X-Treg-Token": ADMIN})).status_code == 200  # reads stay
+
+
+async def test_versions_never_move_backwards_when_writes_commit_out_of_order(clients, store):
+    """Concurrent writes: the version row is a conditional UPDATE, so a write whose audit id is
+    lower can never overwrite a higher version that committed first."""
+    from treg.application.ratelimit import blocklist_admin
+    async with session_maker() as db:
+        await blocklist_admin._bump_version(db, 9, utcnow_naive())
+        await db.commit()
+    async with session_maker() as db:
+        await blocklist_admin._bump_version(db, 7, utcnow_naive())  # the slower, older write
+        await db.commit()
+    assert (await _rows(BlocklistVersion))[0].version == 9
+
+
+async def test_readback_is_not_live_while_a_process_misses_its_heartbeat(clients, store, slack):
+    org_id, _ = await _new_org(clients)
+    version = (await clients.post("/admin/blocklist", headers=BOT_H, json=_body(("org_id", str(org_id))))).json()["version"]
+    await background.blocklist_step()  # this process loads it and heartbeats
+    store.live["rl:live:other"] = json.dumps({"process_instance": "other", "blocklist_version": version - 1})
+    r = (await clients.get(f"/admin/blocklist/status?version={version}", headers=BOT_H)).json()
+    assert r["live"] is False  # one process still serves the older list
+    del store.live["rl:live:other"]  # its heartbeat expired: not counted as serving
+    assert (await clients.get(f"/admin/blocklist/status?version={version}", headers=BOT_H)).json()["live"] is True

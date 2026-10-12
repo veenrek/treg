@@ -82,7 +82,6 @@ redis.call('SET', KEYS[1], ARGV[1])
 return 1
 """
 RL_CONFIG_KEY = "rl:config"
-RL_BLOCKLIST_KEY = "rl:blocklist"
 RL_GLOBAL_KEY = "rl:g:c"
 RL_LIVE_PREFIX = "rl:live:"
 

@@ -8,6 +8,7 @@ sources:
   - src/treg/application/ratelimit/limiter.py
   - src/treg/application/ratelimit/config_state.py
   - src/treg/application/ratelimit/blocklist_state.py
+  - src/treg/application/ratelimit/blocklist_sync.py
   - src/treg/application/ratelimit/background.py
   - src/treg/application/ratelimit/metrics.py
   - src/treg/application/ratelimit/signals.py
@@ -29,6 +30,7 @@ sources:
   - tests/test_rate_limit_middleware.py
   - tests/test_rate_limit_admin.py
   - tests/test_rate_limit_overload.py
+  - tests/test_rate_limit_blocklist_sync.py
 related:
   - architecture/import-boundaries.md
   - architecture/money.md
@@ -83,24 +85,21 @@ reason code and the blocklist version, so clients do not retry; the operator's r
 the audit record). The env accepts only `off` or `log_only`; `enforce_403`
 is an audited policy write.
 
-**Source of truth:** `BlocklistEntry` (one row per target, `expires_at` always set, `revoked_at` for
-an unblock) and `BlocklistAudit` (one row per call, append-only; its id is the published
-version). Migrations live in this repo only.
+**Source:** Postgres only. `BlocklistEntry` (one row per target, `expires_at` always set,
+`revoked_at` for an unblock), `BlocklistAudit` (one row per call, append-only) and the single-row
+`BlocklistVersion` (the latest audit id, bumped in the same transaction as every write by a
+conditional UPDATE that never lowers it). Migrations live in this repo only. Redis holds no
+blocklist.
 
-**Distribution:** `rl:blocklist`, one JSON string overwritten whole:
-
-```json
-{"schema_version": 1, "version": <audit id>, "updated_at": "<ISO 8601 UTC>",
- "entries": [{"type": "key_hash" | "org_id", "value": "<sha256 hex | org id>",
-              "reason": "<text>", "expires_at": "<ISO 8601 UTC>", "approved_by": "<name>"}]}
-```
-
-`policy.parse_blocklist` validates it; readers ignore expired entries. Each process reads it every
-`rate_limit_blocklist_refresh_s` in `background.blocklist_loop` (`blocklist_state.refresh_once`),
-never on the request path. An unreadable store or a missing key keeps the last good list; a payload
-that does not parse or has an unknown `schema_version` keeps it too and alerts
-(`rate_limit_blocklist_invalid`). **Missing is never empty**: before a first good read a process has
-no list, reported as `blocklist_loaded: false`.
+**Cache:** every `rate_limit_blocklist_refresh_s` (at least 10 s) each process reads the version by
+primary key on the dedicated `ratelimit` pool (one connection, `statement_timeout`); only a changed
+version reads the active entries (`blocklist_sync.poll_once`). The request path reads the in-memory
+copy only (`blocklist_state`). A failed poll keeps the cached list and logs and alerts once per
+distinct failure (`rate_limit_blocklist_load_failed`); it never empties it. No version row means
+nothing was ever blocked: an authoritative empty list. At startup `blocklist_sync.cold_start`
+retries the first load for up to `rate_limit_blocklist_cold_start_s` before the lifespan yields
+(the app is not ready until then); past that the process fails open, the loop keeps retrying, and
+`blocklist_cache_empty` is reported until a list loads.
 
 **Writer:** expected to move to treg-internal. Until then, every write route here is hard-off
 (404, before auth) unless its token is configured. `POST /admin/blocklist` (`blocklist_admin.block`), authorized by
@@ -117,14 +116,13 @@ and one bad target refuses the whole call:
 - reason, approver and non-empty evidence are required.
 
 The call is budgeted (`blocklist_writes_per_hour`, a shared-store window that fails closed, 429).
-Order: entries and the audit row commit, then the whole active list is published to
-`rl:blocklist` by a compare-and-set that never replaces a newer version. A failed publish reports
-`published: false`. After the write the server posts a receipt (entries, TTL, version, audit id) to
+Entries, the audit row and the version commit in one transaction; there is no second copy to
+publish. After the write the server posts a receipt (entries, TTL, version, audit id) to
 Slack (`receipts`, `blocklist_receipt_slack_token`/`_channel`) in a task: best-effort, counted on
 failure (`blocklist_receipt_failures`), never delaying or undoing the write. `POST
 /admin/blocklist/{id}/unblock` is the one-action unblock. `GET /admin/blocklist/status?version=N` is
-the readback: `live` once the store and every process with a fresh heartbeat (`rl:live:<instance>`)
-serve at least N.
+the readback: `live` once every process with a fresh heartbeat (`rl:live:<instance>`) serves at
+least N. A process whose heartbeat expired is not counted.
 
 The window, per-call cap and write budget defaults are placeholders, to be set from surge signals.
 
@@ -155,7 +153,7 @@ keeps the last good policy for at most `rate_limit_config_max_age_s`; past that 
 as `shadow` and `rate_limit_config_stale` alerts. With nothing good, env defaults serve and
 `rate_limit_config_env_fallback` alerts. Every version change is logged.
 
-**Eviction repair:** the store evicts by LRU. When either key is missing, `background.maybe_restore`
+**Eviction repair:** the store evicts by LRU. When `rl:config` is missing, `background.maybe_restore`
 republishes it from Postgres on the dedicated `ratelimit` pool, at most once per
 `rate_limit_republish_interval_s` across processes (a store claim). The request path never reads
 Postgres (import contract).

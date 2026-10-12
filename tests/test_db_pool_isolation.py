@@ -73,6 +73,7 @@ EXPECTED_MAKERS: dict[str, set[str]] = {
     # The rate limiter's background work (surge-signal flush, eviction restore) has its own pool.
     "application/ratelimit/background.py": {RATELIMIT},
     "application/ratelimit/signals_flush.py": {RATELIMIT},
+    "application/ratelimit/blocklist_sync.py": {RATELIMIT},  # the blocklist version poll
     # `treg-worker` is its own process; it shares the API pool because nothing else is running in it.
     "worker.py": {API},
     # Runs only inside `treg-worker catalog stats`; same reasoning as `worker.py`.

@@ -2085,9 +2085,10 @@ class RateLimitConfigVersion(SQLModel, table=True):
 class BlocklistEntry(SQLModel, table=True):
     """One blocked API key (by its SHA-256, the `ApiKey.key_hash` spelling) or org (by id).
 
-    The source of truth for `rl:blocklist`. Written only by `application/ratelimit/blocklist_admin.py`
-    through `/admin/blocklist`, each write with a `BlocklistAudit` row, then published. An entry is
-    active until `expires_at` or `revoked_at`; there is no delete."""
+    The blocklist's only source: serving processes cache the active rows in memory and reload them
+    when `BlocklistVersion` changes. Written only by `application/ratelimit/blocklist_admin.py`
+    through `/admin/blocklist`, each write with a `BlocklistAudit` row. An entry is active until
+    `expires_at` or `revoked_at`; there is no delete."""
     id: int | None = Field(default=None, primary_key=True)
     kind: str = Field(index=True)            # key_hash | org_id (the payload's `type`)
     value: str = Field(index=True)           # sha256 hex | decimal org id
@@ -2100,6 +2101,15 @@ class BlocklistEntry(SQLModel, table=True):
     revoked_at: NaiveUTC | None = None
     revoked_by: str | None = None
     revoke_reason: str | None = None
+
+
+class BlocklistVersion(SQLModel, table=True):
+    """One row (`id = 1`): the blocklist's current version, the latest `BlocklistAudit` id. Bumped
+    in the same transaction as every blocklist write; serving processes poll it by primary key and
+    reload the active entries only when it changes. No row = nothing was ever blocked."""
+    id: int = Field(default=1, primary_key=True)
+    version: int
+    updated_at: NaiveUTC = Field(default_factory=_now)
 
 
 class BlocklistAudit(SQLModel, table=True):

@@ -84,3 +84,19 @@ def install(monkeypatch) -> FakeRateLimitStore:
     monkeypatch.setattr(kv, "configured", lambda: True)
     monkeypatch.setattr(kv, "_store", store)
     return store
+
+
+def install_blocklist(*entries, version: int = 5):
+    """Put a blocklist in the process cache the way `blocklist_sync` does after a Postgres load.
+    `entries` are (type, value, expires_in_seconds)."""
+    import time
+
+    from treg.application.ratelimit import blocklist_state
+    from treg.domain.ratelimit import BlockEntry, Blocklist
+
+    now = time.time()
+    bl = Blocklist.build(version, "2026-01-01T00:00:00Z", tuple(
+        BlockEntry(kind, value, "flood from one IP", now + expires_in, "ops")
+        for kind, value, expires_in in entries))
+    blocklist_state.install(bl)
+    return bl

@@ -7,12 +7,9 @@ import json
 
 import pytest
 
-from treg.application.ratelimit import blocklist_state, limiter, metrics
+from treg.application.ratelimit import limiter, metrics
 from treg.bootstrap_ratelimit import RateLimitMiddleware
 from treg.config import get_settings
-from treg.domain.ratelimit import parse_blocklist
-from treg.infra import kv
-from tests.fake_rate_limit_store import install
 
 
 @pytest.fixture(autouse=True)
@@ -156,29 +153,11 @@ async def test_health_and_admin_are_never_counted(path):
     await asyncio.gather(*held)
 
 
-# ---- the blocklist cache: read failures never empty it; nothing matches by accident ----------------
-async def test_a_blocklist_read_failure_keeps_the_last_good_cache(monkeypatch):
-    store = install(monkeypatch)
-    store.docs[kv.RL_BLOCKLIST_KEY] = json.dumps({
-        "schema_version": 1, "version": 3, "updated_at": "2026-10-12T00:00:00Z",
-        "entries": [{"type": "org_id", "value": "7", "reason": "r", "approved_by": "o",
-                     "expires_at": "2099-01-01T00:00:00Z"}]})
-    good = await blocklist_state.refresh_once()
-    store.down = True
-    for _ in range(3):
-        assert await blocklist_state.refresh_once() is good
-    store.down = False
-    for bad in ("", "null", "{}", json.dumps({"schema_version": 1, "version": 4, "entries": None})):
-        store.docs[kv.RL_BLOCKLIST_KEY] = bad
-        assert await blocklist_state.refresh_once() is good
-    assert blocklist_state.current().active(now=0) == 1
-
-
+# ---- the blocklist cache: nothing matches by accident -------------------------------------------
 def _list(*entries):
-    return parse_blocklist(json.dumps({
-        "schema_version": 1, "version": 1, "updated_at": "2026-10-12T00:00:00Z",
-        "entries": [{"type": k, "value": v, "reason": "r", "approved_by": "o",
-                     "expires_at": "2099-01-01T00:00:00Z"} for k, v in entries]}))
+    from treg.domain.ratelimit import BlockEntry, Blocklist
+    return Blocklist.build(1, "2026-10-12T00:00:00Z", tuple(
+        BlockEntry(k, v, "r", 4_000_000_000, "o") for k, v in entries))
 
 
 def test_a_null_org_id_never_matches():

@@ -20,7 +20,7 @@ from treg.config import get_settings
 from treg.domain.ratelimit import RateLimitConfig
 from treg.infra import db as infra_db
 from treg.infra import kv, request_scope
-from tests.fake_rate_limit_store import install
+from tests.fake_rate_limit_store import install, install_blocklist
 
 
 @pytest.fixture(autouse=True)
@@ -39,13 +39,7 @@ def _enforce_blocklist() -> None:
 
 
 async def _block_org(monkeypatch, org_id: int) -> None:
-    store = install(monkeypatch)
-    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    store.docs[kv.RL_BLOCKLIST_KEY] = json.dumps({
-        "schema_version": 1, "version": 3, "updated_at": expires,
-        "entries": [{"type": "org_id", "value": str(org_id), "reason": "flood", "approved_by": "ops",
-                     "expires_at": expires}]})
-    await blocklist_state.refresh_once()
+    install_blocklist(("org_id", str(org_id), 3600), version=3)
 
 
 @contextmanager
@@ -125,10 +119,7 @@ async def test_unblocking_takes_effect_without_waiting_for_the_key_cache(clients
     org_id = await _org_of(clients)
     await _block_org(monkeypatch, org_id)
     assert (await clients.get("/tools")).status_code == 403
-    store = install(monkeypatch)  # what an unblock publishes: a newer list without the org
-    store.docs[kv.RL_BLOCKLIST_KEY] = json.dumps({"schema_version": 1, "version": 4,
-                                                   "updated_at": "2026-01-01T00:00:00Z", "entries": []})
-    await blocklist_state.refresh_once()
+    install_blocklist(version=4)  # what the poll loads after an unblock: a newer list without the org
     assert (await clients.get("/tools")).status_code == 200
 
 
@@ -279,15 +270,13 @@ def test_uvicorn_trusts_forwarded_for_only_from_loopback_by_default(monkeypatch)
 # ---- the 403 carries a fixed code only ----------------------------------------------------------
 async def test_the_blocklist_403_never_reveals_the_operators_reason(clients, monkeypatch):
     from treg import crypto
+    import time
+    from treg.domain.ratelimit import BlockEntry, Blocklist
     _enforce_blocklist()
-    store = install(monkeypatch)
-    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     secret_reason = "matched signup burst rule 7 from the surge query"
-    store.docs[kv.RL_BLOCKLIST_KEY] = json.dumps({
-        "schema_version": 1, "version": 3, "updated_at": expires,
-        "entries": [{"type": "key_hash", "value": crypto.hash_token(clients.headers["X-Treg-Token"]),
-                     "reason": secret_reason, "approved_by": "ops", "expires_at": expires}]})
-    await blocklist_state.refresh_once()
+    blocklist_state.install(Blocklist.build(3, "2026-01-01T00:00:00Z", (BlockEntry(
+        "key_hash", crypto.hash_token(clients.headers["X-Treg-Token"]), secret_reason,
+        time.time() + 3600, "ops"),)))
     r = await clients.get("/tools")
     assert r.status_code == 403
     assert r.json() == {"detail": {"error": "blocked", "reason": "treg_blocklist.key_hash",

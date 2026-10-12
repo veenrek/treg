@@ -1,9 +1,10 @@
 """The rate limiter's background work, started by every role's lifespan.
 
 - `config_loop`: reads `rl:config` every `rate_limit_config_refresh_s`.
-- `blocklist_loop`: reads `rl:blocklist` every `rate_limit_blocklist_refresh_s` and writes this
+- `blocklist_loop`: polls the blocklist version in Postgres every `rate_limit_blocklist_refresh_s`
+  (`blocklist_sync`), reporting `blocklist_cache_empty` until a list has loaded, and writes this
   process's heartbeat (versions and modes) to `rl:live:<instance>`, which the admin status reads.
-- `maybe_restore`: when either key is missing (the store evicts by LRU), republishes it from
+- `maybe_restore`: when `rl:config` is missing (the store evicts by LRU), republishes it from
   Postgres on the `ratelimit` pool. A store claim limits that to once per
   `rate_limit_republish_interval_s` across every process; missing never means empty.
 - `maintenance_loop`: flushes surge signals and emits the window's telemetry.
@@ -25,7 +26,7 @@ from ...infra import kv
 from ...infra.db import install_checkout_peaks, pool_snapshot, ratelimit_session_maker, take_checkout_peaks
 from ...infra.money_timing import PROCESS_INSTANCE
 from . import admin as config_admin
-from . import blocklist_admin, blocklist_state, config_state, inflight, metrics, receipts, signals_flush
+from . import blocklist_state, blocklist_sync, config_state, inflight, metrics, receipts, signals_flush
 from .limiter import limiter
 
 log = logging.getLogger("treg.ratelimit")
@@ -47,8 +48,7 @@ def process_status() -> dict:
 
 async def maybe_restore(name: str) -> int | None:
     """Republish `rl:<name>` from Postgres when it went missing, at most once per interval."""
-    is_missing = config_state.missing() if name == "config" else blocklist_state.missing()
-    if not is_missing or not kv.configured():
+    if name != "config" or not config_state.missing() or not kv.configured():
         return None
     interval = get_settings().rate_limit_republish_interval_s
     now = time.monotonic()
@@ -60,9 +60,8 @@ async def maybe_restore(name: str) -> int | None:
             return None  # another process restored it inside this interval
     except kv.Unavailable:
         return None
-    restorer = config_admin.restore if name == "config" else blocklist_admin.restore
     async with ratelimit_session_maker() as db:
-        version = await restorer(db)
+        version = await config_admin.restore(db)
     log.warning("rate_limit_%s_restored %s", name, json.dumps(
         {"event": f"rate_limit_{name}_restored", "version": version}, separators=(",", ":")))
     metrics.count(f"{name}_restores")
@@ -109,8 +108,8 @@ async def config_step() -> None:
 
 
 async def blocklist_step() -> None:
-    await blocklist_state.refresh_once()
-    await maybe_restore("blocklist")
+    await blocklist_sync.poll_once()
+    blocklist_sync.report_empty()
     if kv.configured():
         try:
             await kv.store().rl_heartbeat(kv.RL_LIVE_PREFIX + PROCESS_INSTANCE,
@@ -202,3 +201,4 @@ async def run() -> None:
 def reset_for_tests() -> None:
     _last_restore.clear()
     signals_flush.reset_for_tests()
+    blocklist_sync.reset_for_tests()

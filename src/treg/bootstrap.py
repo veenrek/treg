@@ -27,6 +27,7 @@ from .application import arena, find_index
 from .application.onboard import first_run
 from . import bootstrap_handlers
 from .application.ratelimit import background as rate_limit_background
+from .application.ratelimit import blocklist_sync as rate_limit_blocklist_sync
 from .bootstrap_ratelimit import RateLimitMiddleware
 from .bootstrap_http import (
     _BodyDecodeMiddleware,
@@ -697,7 +698,10 @@ def _lifespan(role: AppRole):
                 else None
             )
             gauge_task = asyncio.create_task(pool_gauge()) if analytics.enabled() else None
-            # Every role serves HTTP behind the limiter, so every role refreshes its policy.
+            # Every role serves HTTP behind the limiter, so every role refreshes its policy. The
+            # first blocklist load is retried (bounded) before the app reports ready; past that it
+            # fails open and the background loop keeps trying.
+            await rate_limit_blocklist_sync.cold_start()
             rate_limit_task = asyncio.create_task(rate_limit_background.run())
             # Local transaction diagnostics run even when the analytics transport is disabled.
             trace_runner = start_money_trace(role=role)

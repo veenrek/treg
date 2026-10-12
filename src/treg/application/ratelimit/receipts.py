@@ -23,8 +23,7 @@ _tasks: set[asyncio.Task] = set()
 
 
 def _text(action: str, result: dict) -> str:
-    lines = [f"treg blocklist {action}: version {result['version']}, audit {result['audit_id']}, "
-             f"{'published' if result['published'] else 'NOT published yet'}"]
+    lines = [f"treg blocklist {action}: version {result['version']}, audit {result['audit_id']}"]
     if action == "block":
         lines.append(f"TTL {result['ttl_s']} s (auto-unblock)")
     for e in result["entries"][:50]:

@@ -126,8 +126,9 @@ agents then built against a constitution that was wrong.
   session and money admission: an in-process overload cap (off by default), the blocklist (by key
   hash before auth, by org after; `log_only` by default) and a global concurrency ceiling (`shadow`
   by default) that fails open when the shared store cannot answer. Its policy and blocklist are
-  written only by `application/ratelimit/admin.py` and `blocklist_admin.py` (audited tables, then
-  `rl:config` / `rl:blocklist`); the request path reads memory only. The env cannot refuse
+  written only by `application/ratelimit/admin.py` (audited table, then `rl:config`) and
+  `blocklist_admin.py` (Postgres only; processes poll its version and cache the entries); the
+  request path reads memory only. The env cannot refuse
   requests; that needs an audited admin write. See `docs/context/architecture/rate-limit.md`.
 - **Feedback handling.** This repo owns `FeedbackHandling` and `FeedbackHandlingEvent` models and
   migrations; the private admin service is their only runtime writer. Original reports remain
