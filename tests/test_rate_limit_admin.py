@@ -356,7 +356,8 @@ WRITES = [("post", "/admin/blocklist", {"entries": [{"type": "org_id", "value": 
           ("post", "/admin/blocklist/1/unblock", {"approved_by": "o", "reason": "r"}),
           ("put", "/admin/rate-limit/config", {"config": {}, "note": "x"}),
           ("post", "/admin/rate-limit/config/revert-to-shadow", {}),
-          ("post", "/admin/rate-limit/config/republish", {})]
+          ("post", "/admin/rate-limit/config/republish", {}),
+          ("post", "/admin/blocklist/mode", {"mode": "enforce_403", "approved_by": "o", "reason": "r"})]
 
 
 @pytest.mark.parametrize("method,path,body", WRITES)
