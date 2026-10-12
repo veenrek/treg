@@ -64,7 +64,7 @@ def test_env_accepts_off_and_shadow(mode):
 def test_env_defaults_hardcode_no_capacity():
     defaults = Settings().rate_limit_defaults
     assert defaults.global_concurrency is None and defaults.global_paid_reserve == 0
-    assert defaults.mode == "shadow" and defaults.blocklist_mode == "log_only"
+    assert defaults.mode == "off" and defaults.blocklist_mode == "log_only"
 
 
 @pytest.mark.parametrize("bad", [
@@ -86,13 +86,13 @@ async def test_a_valid_document_is_loaded_and_its_version_logged(monkeypatch, ca
     assert (state.version, state.source, state.fallback, state.degraded) == (3, "store", False, False)
     assert state.config.global_cap("unpaid") == 30
     change = _changes(caplog)[-1]
-    assert (change["version"], change["mode"]) == (3, "shadow")
+    assert (change["version"], change["mode"]) == (3, "off")
 
 
 async def test_the_version_is_logged_on_every_change_and_only_then(monkeypatch, caplog):
     store = install(monkeypatch)
     caplog.set_level(logging.INFO, logger="treg.ratelimit")
-    store.docs[kv.RL_CONFIG_KEY] = _doc(3)
+    store.docs[kv.RL_CONFIG_KEY] = _doc(3, mode="shadow")
     await config_state.refresh_once()
     await config_state.refresh_once()
     store.docs[kv.RL_CONFIG_KEY] = _doc(4, mode="off")
@@ -153,7 +153,7 @@ async def test_with_nothing_good_the_env_defaults_serve_and_alert(monkeypatch, c
     assert state.config.mode in ("off", "shadow")
     assert any(r.getMessage().startswith("rate_limit_config_env_fallback") and r.levelno == logging.ERROR
                for r in caplog.records)
-    assert alerts == [("ratelimit_config_env_fallback", {"reason": "missing", "mode": "shadow"})]
+    assert alerts == [("ratelimit_config_env_fallback", {"reason": "missing", "mode": "off"})]
     _, gauge = await background.emit()
     assert gauge["config_fallback"] is True and gauge["config_source"] == "env"
 
@@ -215,3 +215,26 @@ async def test_the_config_loop_refreshes_on_its_interval(monkeypatch):
     assert sleeps == [7.0, 7.0, 7.0]
     assert store.calls[f"rl_get:{kv.RL_CONFIG_KEY}"] == 3
     assert config_state.current().version == 5
+
+
+async def test_a_slow_store_is_a_miss_within_the_budget(monkeypatch):
+    """Slow but not failing: past `rate_limit_store_timeout_ms` the call is a miss (Unavailable),
+    so the ceiling falls back to the per-process one and a read keeps its last good copy."""
+    import time
+
+    class SlowClient:
+        async def eval(self, *a):
+            await asyncio.sleep(0.5)
+            return [1, 1, 1]
+
+        async def get(self, key):
+            await asyncio.sleep(0.5)
+
+    store = kv.RedisStore.__new__(kv.RedisStore)
+    store._client = SlowClient()
+    started = time.monotonic()
+    with pytest.raises(kv.Unavailable):
+        await store.rl_admit_global("m", 5, 60_000, False)
+    assert time.monotonic() - started < 0.2  # the 30 ms default budget, not the store's pace
+    with pytest.raises(kv.Unavailable):
+        await store.rl_get(kv.RL_CONFIG_KEY)

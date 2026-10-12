@@ -125,7 +125,9 @@ The window, per-call cap and write budget defaults are placeholders, to be set f
 
 ## Global concurrency ceiling
 
-Mode `off`, `shadow` (default; logs `rate_limit_would_block`) or `enforce` (**429**, `Retry-After`).
+Mode `off` (the env default, until the store's request-path latency is measured), `shadow` (logs
+`rate_limit_would_block`) or `enforce` (**429**, `Retry-After`). Each limiter store call has a
+`rate_limit_store_timeout_ms` budget; a slower answer is a miss.
 One Lua script (`kv._RL_ADMIT_GLOBAL`) over a sorted set of request ids scored by start time;
 entries older than `concurrency_ttl_s` (at least `call_timeout_s`) age out; the middleware's
 `finally` removes the request. `global_paid_reserve` slots are usable by paid orgs only

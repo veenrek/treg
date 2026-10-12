@@ -312,7 +312,7 @@ class RedisStore:
 
     async def _rl(self, coro_fn):
         try:
-            async with asyncio.timeout(_TIMEOUT_S * 2):
+            async with asyncio.timeout(get_settings().rate_limit_store_timeout_ms / 1000):
                 return await coro_fn()
         except Exception as exc:  # noqa: BLE001 - cancellation still propagates
             raise Unavailable(type(exc).__name__) from exc

@@ -253,7 +253,7 @@ async def _hold(caller: Caller | None):
 
 
 async def test_global_ceiling_in_shadow_logs_would_block_with_its_reason(clients, caplog):
-    use(global_concurrency=1)
+    use(mode="shadow", global_concurrency=1)
     await _learn(clients)
     await _hold(None)
     caplog.set_level(logging.INFO, logger="treg.ratelimit")

@@ -152,7 +152,8 @@ class Settings(BaseSettings):
     # without a redeploy. Refusing requests (`enforce`, `enforce_403`) is refused here on purpose:
     # it needs an audited admin write. An unset global ceiling is measured and refuses nothing; its
     # figure comes from measured peak in-flight concurrency and p95 latency, never from this file.
-    rate_limit_mode: str = "shadow"
+    # Off until the shared store's latency on the request path is measured; then shadow.
+    rate_limit_mode: str = "off"
     rate_limit_blocklist_mode: str = "log_only"
     rate_limit_global_concurrency: int | None = None
     rate_limit_global_paid_reserve: int = 0
@@ -169,6 +170,9 @@ class Settings(BaseSettings):
     rate_limit_key_cache_ttl_s: float = Field(default=60.0, ge=1, le=3600)
     rate_limit_key_cache_size: int = Field(default=10_000, ge=100, le=1_000_000)
     rate_limit_store_cooldown_s: float = Field(default=1.0, ge=0, le=60)
+    # The limiter's budget per shared-store call. A slower answer is a miss: the ceiling falls back
+    # to the per-process one, a config or blocklist read keeps the last good copy.
+    rate_limit_store_timeout_ms: int = Field(default=30, ge=20, le=50)
     rate_limit_log_max_per_window: int = Field(default=600, ge=0, le=100_000)
     rate_limit_exempt_paths: str = "/health,/stripe/webhook,/billing/stripe/webhook"
     # The per-process hard overload cap: an in-process semaphore, no shared store. When every permit
@@ -197,7 +201,7 @@ class Settings(BaseSettings):
     blocklist_default_ttl_s: int = Field(default=86_400, ge=60, le=30 * 86_400)
     blocklist_max_ttl_s: int = Field(default=7 * 86_400, ge=60, le=30 * 86_400)
     blocklist_new_org_max_age_s: int = Field(default=7 * 86_400, ge=60, le=365 * 86_400)
-    blocklist_max_entries_per_call: int = Field(default=100, ge=1, le=1_000)
+    blocklist_max_entries_per_call: int = Field(default=50, ge=1, le=50)
     blocklist_writes_per_hour: int = Field(default=30, ge=1, le=10_000)
     # The write receipt: a Slack bot token and the channel (or user id) it posts to. Both empty =
     # no receipt. Best-effort: a failed post is counted and logged, never undoes a write.
