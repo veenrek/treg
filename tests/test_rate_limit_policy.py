@@ -39,7 +39,7 @@ def _config(**update) -> RateLimitConfig:
     {"concurrency_ttl_s": 5},
     {"concurrency_retry_after_s": 0},
     {"mode": "panic"},
-    {"blocklist_mode": "enforce"},
+    {"blocklist_mode": "log_only"},  # not a policy field: it lives on the blocklist's version row
     {"surprise": 1},
 ])
 def test_write_time_ranges_reject_typos(bad):

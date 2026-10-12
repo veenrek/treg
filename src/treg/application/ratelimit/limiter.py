@@ -89,7 +89,8 @@ class RateLimiter:
             slot["want_caller"] = True
         a = Admission(state, learn, caller=caller)
 
-        if cfg.blocklist_mode != "off" and not facts.trusted:
+        bl = blocklist_state.current()
+        if bl is not None and bl.mode != "off" and not facts.trusted:
             slot["check_org"] = lambda org_id: self._check_org(a, facts, org_id)
             hit = self._match("key_hash", facts.key_hash)
             kind = "key_hash"
@@ -159,15 +160,16 @@ class RateLimiter:
 
     def _blocked(self, a: Admission, facts: RequestFacts, kind: str, entry: BlockEntry, *,
                  org_id: int | None = None) -> Rejection | None:
-        cfg, bl = a.state.config, blocklist_state.current()
-        enforce = cfg.blocklist_mode == "enforce_403"
+        bl = blocklist_state.current()
+        mode = bl.mode if bl else "off"
+        enforce = mode == "enforce_403"
         reason = BLOCKLIST_REASONS[kind]
         a.blocked = True
         paid = bool(a.caller and a.caller.paid)
         metrics.decision(layer="blocklist", reason=reason, result="reject" if enforce else "log_only",
-                         tier=_tier(a.caller), paid=paid, version=a.state.version, mode=cfg.blocklist_mode)
+                         tier=_tier(a.caller), paid=paid, version=a.state.version, mode=mode)
         metrics.event_log(logging.WARNING, "rate_limit_blocklist_match", {
-            "match": kind, "reason": reason, "mode": cfg.blocklist_mode, "enforced": enforce,
+            "match": kind, "reason": reason, "mode": mode, "enforced": enforce,
             "blocklist_version": bl.version if bl else None, "config_version": a.state.version,
             "key_hash": facts.key_hash[:12] if facts.key_hash else None,
             "org_id": org_id or (a.caller.org_id if a.caller else None), "ip": facts.ip, "paid": paid,

@@ -79,27 +79,35 @@ Every refusing layer has its own label: `overload_cap`, `treg_blocklist.key_hash
 
 ## Blocklist
 
-Mode `blocklist_mode`: `off`, `log_only` (the default: match, log `rate_limit_blocklist_match`,
-serve), `enforce_403` (refuse with **403**, `X-Treg-Block-Reason`, a body holding only the fixed
+Mode (on the version row, set by `POST /admin/blocklist/mode`, and back to `log_only` by the
+policy's `revert-to-shadow`): `off`, `log_only` (the default: match, log
+`rate_limit_blocklist_match`, serve), `enforce_403` (refuse with **403**, `X-Treg-Block-Reason`, a body holding only the fixed
 reason code and the blocklist version, so clients do not retry; the operator's reason text stays in
-the audit record). The env accepts only `off` or `log_only`; `enforce_403`
-is an audited policy write.
+the audit record).
 
 **Source:** Postgres only. `BlocklistEntry` (one row per target, `expires_at` always set,
-`revoked_at` for an unblock), `BlocklistAudit` (one row per call, append-only) and the single-row
-`BlocklistVersion` (the latest audit id, bumped in the same transaction as every write by a
-conditional UPDATE that never lowers it). Migrations live in this repo only. Redis holds no
+`revoked_at` for an unblock), `BlocklistAudit` (one row per call, append-only, carrying the version
+it produced) and the single `BlocklistVersion` row (version and mode), pre-inserted by migration
+0070. Every block, unblock or mode change runs `UPDATE ... SET version = version + 1 RETURNING
+version` on it in the same transaction as its rows (`blocklist_admin.advance`); the row lock
+serializes writers and the returned value is the version the readback waits for. Redis holds no
 blocklist.
 
-**Cache:** every `rate_limit_blocklist_refresh_s` (at least 10 s) each process reads the version by
-primary key on the dedicated `ratelimit` pool (one connection, `statement_timeout`); only a changed
-version reads the active entries (`blocklist_sync.poll_once`). The request path reads the in-memory
-copy only (`blocklist_state`). A failed poll keeps the cached list and logs and alerts once per
-distinct failure (`rate_limit_blocklist_load_failed`); it never empties it. No version row means
-nothing was ever blocked: an authoritative empty list. At startup `blocklist_sync.cold_start`
-retries the first load for up to `rate_limit_blocklist_cold_start_s` before the lifespan yields
-(the app is not ready until then); past that the process fails open, the loop keeps retrying, and
-`blocklist_cache_empty` is reported until a list loads.
+**Cache:** every `rate_limit_blocklist_refresh_s` (at least 10 s) each process reads the version
+row by primary key on the dedicated `ratelimit` pool (one connection, statement and connect
+timeouts), the whole poll bounded by `rate_limit_blocklist_poll_timeout_s`. Only a changed version
+or mode reloads, and the reload reads version, mode and active entries in one statement
+(`blocklist_sync._read_snapshot`), so a new version is never cached with old entries. A reload past
+`rate_limit_blocklist_max_entries` is refused whole: the last good list stays and the process
+alerts. A failed poll keeps the cached list and alerts once per distinct failure
+(`rate_limit_blocklist_load_failed`). The request path reads the in-memory copy only
+(`blocklist_state`).
+
+**Startup:** each worker makes one first-load attempt capped at
+`rate_limit_blocklist_first_load_s` (`blocklist_sync.first_load`, one log line with pid and elapsed
+ms) and serves either way. On failure it fails open, the background loop retries every couple of
+seconds, and `blocklist_cache_empty` is reported until a list loads. `/health` never depends on the
+blocklist.
 
 **Writer:** expected to move to treg-internal. Until then, every write route here is hard-off
 (404, before auth) unless its token is configured. `POST /admin/blocklist` (`blocklist_admin.block`), authorized by
@@ -144,8 +152,8 @@ The key cache (`KeyCache`, `request_scope.key_id`) learns a key's org, paid stat
 
 ## Policy
 
-`RateLimitConfig` (mode, blocklist mode, global figures). **Env** holds defaults (mode `off` or
-`shadow`, blocklist `off` or `log_only`). **Postgres** `RateLimitConfigVersion` is the audited
+`RateLimitConfig` (mode and the global figures; the blocklist's mode is on its own row). **Env** holds defaults (mode `off` or
+`shadow`). **Postgres** `RateLimitConfigVersion` is the audited
 source (`PUT /admin/rate-limit/config`, super-admin; range checked; `enforce` needs
 `enforce_approval`; `revert-to-shadow` is one audited action). **`rl:config`** is the copy processes
 read every `rate_limit_config_refresh_s` in the background. A bad, missing or unreadable value
@@ -163,8 +171,9 @@ Postgres (import contract).
 Record-only. `signals` aggregates in process memory per IP, per org and per (IP, org): requests,
 call requests, unknown keys, 401/403/429/5xx, blocklist matches, distinct orgs and keys, peak in
 flight; bounded by `surge_max_subjects`. `signals_flush` writes one `SurgeSignal` row per subject
-per `surge_flush_s` on the `ratelimit` pool, with the org's `created_at` and paid total, and prunes
-past `surge_retention_days`. The client IP is the ASGI peer; the middleware never reads a forwarded-for header. `python -m
+per `surge_flush_s` on the `ratelimit` pool, with the org's `created_at` and paid total. Pruning past
+`surge_retention_days` is a separate transaction after the insert, at most hourly, with the attempt
+time recorded before the DELETE, so a failed prune never takes an insert batch with it. The client IP is the ASGI peer; the middleware never reads a forwarded-for header. `python -m
 treg` starts uvicorn with its defaults: `proxy_headers` on, `forwarded_allow_ips` from
 `FORWARDED_ALLOW_IPS` or loopback only. So a forwarded-for header is applied only from a trusted
 peer, and behind a load balancer whose address is not trusted the peer is that hop. Trusting

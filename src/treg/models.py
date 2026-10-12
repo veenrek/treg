@@ -2104,11 +2104,12 @@ class BlocklistEntry(SQLModel, table=True):
 
 
 class BlocklistVersion(SQLModel, table=True):
-    """One row (`id = 1`): the blocklist's current version, the latest `BlocklistAudit` id. Bumped
-    in the same transaction as every blocklist write; serving processes poll it by primary key and
-    reload the active entries only when it changes. No row = nothing was ever blocked."""
+    """The single row (`id = 1`, inserted by migration 0070): the blocklist's version and mode.
+    Every blocklist write and every mode change runs `version = version + 1` on it in the same
+    transaction; serving processes poll it by primary key and reload only when it changes."""
     id: int = Field(default=1, primary_key=True)
-    version: int
+    version: int = 0
+    mode: str = "log_only"  # off | log_only | enforce_403
     updated_at: NaiveUTC = Field(default_factory=_now)
 
 
@@ -2116,7 +2117,8 @@ class BlocklistAudit(SQLModel, table=True):
     """One row per blocklist call (block or unblock), append-only. Its id is the published version."""
     id: int | None = Field(default=None, primary_key=True)
     entry_ids: list = Field(sa_column=Column(JSON, nullable=False))
-    action: str                              # block | unblock
+    version: int                             # the blocklist version this change produced
+    action: str                              # block | unblock | mode
     actor: str                               # the authenticated principal (e.g. the bot token)
     approved_by: str                         # the human who confirmed
     reason: str

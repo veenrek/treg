@@ -62,6 +62,12 @@ class BlockIn(BaseModel):
     ttl_s: int | None = None
 
 
+class ModeIn(BaseModel):
+    mode: str
+    approved_by: str
+    reason: str
+
+
 class UnblockIn(BaseModel):
     approved_by: str
     reason: str
@@ -190,3 +196,16 @@ async def admin_blocklist_unblock(
         raise HTTPException(status_code=400, detail={"error": "rejected", "errors": exc.errors})
     except blocklist_admin.UnknownEntry:
         raise HTTPException(status_code=404, detail="no such blocklist entry")
+
+
+@router.post("/admin/blocklist/mode", include_in_schema=False, dependencies=[Depends(_blocklist_writes_on)])
+async def admin_blocklist_mode(
+    body: ModeIn, principal: str = Depends(require_blocklist_writer),
+    db: AsyncSession = Depends(get_admin_session),
+) -> dict:
+    """off | log_only | enforce_403, with version + 1 and an audit row in one transaction."""
+    try:
+        return await blocklist_admin.set_mode(db, body.mode, actor=principal,
+                                              approved_by=body.approved_by, reason=body.reason)
+    except blocklist_admin.Rejected as exc:
+        raise HTTPException(status_code=400, detail={"error": "rejected", "errors": exc.errors})

@@ -142,7 +142,7 @@ async def test_a_paid_org_is_rejected(clients, store, slack):
     assert r.status_code == 400
     assert any("has paid" in e for e in r.json()["detail"]["errors"])
     assert not await _rows(BlocklistEntry) and not await _rows(BlocklistAudit)
-    assert not await _rows(BlocklistVersion) and not slack
+    assert (await _rows(BlocklistVersion))[0].version == 0 and not slack
 
 
 async def test_an_old_org_is_rejected(clients, store, slack):
@@ -319,7 +319,7 @@ async def test_policy_writes_are_audited_and_published(clients, store):
                                json={"config": _policy(global_concurrency=80, global_paid_reserve=20),
                                      "note": "from shadow peak"})).json()
     second = (await clients.put("/admin/rate-limit/config", headers=ADMIN_H,
-                                json={"config": _policy(blocklist_mode="enforce_403"), "note": "403 on",
+                                json={"config": _policy(concurrency_retry_after_s=2), "note": "retry later",
                                       "base_version": first["version"]})).json()
     rows = await _rows(RateLimitConfigVersion)
     assert [(r.id, r.action, r.actor, r.previous_version) for r in rows] == [
@@ -382,17 +382,44 @@ async def test_each_write_family_needs_its_own_token(clients, store, slack, monk
     assert (await clients.get("/admin/blocklist", headers={"X-Treg-Token": ADMIN})).status_code == 200  # reads stay
 
 
-async def test_versions_never_move_backwards_when_writes_commit_out_of_order(clients, store):
-    """Concurrent writes: the version row is a conditional UPDATE, so a write whose audit id is
-    lower can never overwrite a higher version that committed first."""
-    from treg.application.ratelimit import blocklist_admin
-    async with session_maker() as db:
-        await blocklist_admin._bump_version(db, 9, utcnow_naive())
-        await db.commit()
-    async with session_maker() as db:
-        await blocklist_admin._bump_version(db, 7, utcnow_naive())  # the slower, older write
-        await db.commit()
-    assert (await _rows(BlocklistVersion))[0].version == 9
+async def test_concurrent_writes_each_get_their_own_version(clients, store, slack):
+    """`version = version + 1 RETURNING version` on one pre-inserted row: N concurrent writers get
+    N distinct versions, the row ends at N, and no write overwrites another's."""
+    orgs = [str((await _new_org(clients))[0]) for _ in range(6)]
+    results = await asyncio.gather(*[
+        clients.post("/admin/blocklist", headers=BOT_H, json=_body(("org_id", org))) for org in orgs])
+    assert all(r.status_code == 200 for r in results), [r.text for r in results]
+    versions = sorted(r.json()["version"] for r in results)
+    assert versions == list(range(1, 7))
+    [row] = await _rows(BlocklistVersion)
+    assert row.version == 6
+    assert sorted(a.version for a in await _rows(BlocklistAudit)) == versions
+    assert await blocklist_sync.poll_once() and blocklist_state.current().active(now=0) == 6
+
+
+async def test_a_mode_change_is_its_own_audited_version(clients, store, slack):
+    r = await clients.post("/admin/blocklist/mode", headers=BOT_H,
+                           json={"mode": "enforce_403", "approved_by": "ops-lead", "reason": "card 12 approved"})
+    assert r.status_code == 200 and r.json()["version"] == 1
+    [row] = await _rows(BlocklistVersion)
+    assert (row.version, row.mode) == (1, "enforce_403")
+    [audit] = await _rows(BlocklistAudit)
+    assert (audit.action, audit.version, audit.approved_by) == ("mode", 1, "ops-lead")
+    assert await blocklist_sync.poll_once() and blocklist_state.current().mode == "enforce_403"
+    bad = await clients.post("/admin/blocklist/mode", headers=BOT_H,
+                             json={"mode": "enforce", "approved_by": "o", "reason": "r"})
+    assert bad.status_code == 400
+
+
+async def test_revert_to_shadow_also_puts_the_blocklist_back_to_log_only(clients, store, slack):
+    await clients.post("/admin/blocklist/mode", headers=BOT_H,
+                       json={"mode": "enforce_403", "approved_by": "o", "reason": "r"})
+    r = await clients.post("/admin/rate-limit/config/revert-to-shadow", headers={"X-Treg-Token": ADMIN},
+                           json={"note": "paging"})
+    assert r.status_code == 200
+    [row] = await _rows(BlocklistVersion)
+    assert (row.version, row.mode) == (2, "log_only")
+    assert [a.action for a in await _rows(BlocklistAudit)] == ["mode", "mode"]
 
 
 async def test_readback_is_not_live_while_a_process_misses_its_heartbeat(clients, store, slack):

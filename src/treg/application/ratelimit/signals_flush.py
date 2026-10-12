@@ -40,7 +40,6 @@ async def _org_facts(db, org_ids: set[int]) -> dict[int, tuple]:
 async def flush() -> int:
     """Write the closed window. Returns the rows written; a failed write is logged and dropped,
     because signals are evidence for a human, never an input to a refusal."""
-    global _last_prune
     window = signals.swap()
     if not window.rows:
         return 0
@@ -58,18 +57,34 @@ async def flush() -> int:
                     blocklist_matches=a.blocklist_matches, distinct_orgs=len(a.orgs),
                     distinct_keys=len(a.keys), max_in_flight=a.max_in_flight,
                 ))
-            now = _now()
-            if _last_prune is None or now - _last_prune >= timedelta(hours=1):
-                cutoff = now - timedelta(days=get_settings().surge_retention_days)
-                await db.execute(delete(SurgeSignal).where(SurgeSignal.window_start < cutoff))
-                _last_prune = now
             await db.commit()
     except Exception:  # noqa: BLE001 - a lost minute of evidence must not stop the loop
         log.exception("surge signal flush failed; %d rows dropped", len(window.rows))
         return 0
     if window.dropped:
         log.warning("surge signal window dropped %d subjects past surge_max_subjects", window.dropped)
+    await prune()
     return len(window.rows)
+
+
+async def prune() -> bool:
+    """At most hourly, in its own transaction after the insert has committed. The attempt time is
+    recorded BEFORE the DELETE, so a prune that times out is retried next hour, not every minute,
+    and can never take an insert batch with it."""
+    global _last_prune
+    now = _now()
+    if _last_prune is not None and now - _last_prune < timedelta(hours=1):
+        return False
+    _last_prune = now
+    cutoff = now - timedelta(days=get_settings().surge_retention_days)
+    try:
+        async with ratelimit_session_maker() as db:
+            await db.execute(delete(SurgeSignal).where(SurgeSignal.window_start < cutoff))
+            await db.commit()
+    except Exception:  # noqa: BLE001 - pruning is housekeeping; the next attempt is in an hour
+        log.exception("surge signal prune failed")
+        return False
+    return True
 
 
 

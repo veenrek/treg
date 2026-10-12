@@ -51,9 +51,12 @@ def test_env_refuses_enforce():
         Settings(rate_limit_mode="enforce")
 
 
-def test_env_refuses_blocklist_enforce_403():
-    with pytest.raises(ValidationError, match="enforce_403 is set only through the audited admin endpoint"):
-        Settings(rate_limit_blocklist_mode="enforce_403")
+def test_the_blocklist_mode_is_not_part_of_the_policy():
+    """It lives on the blocklistversion row; a policy document carrying it is refused."""
+    doc = get_settings().rate_limit_defaults.model_dump(mode="json")
+    assert "blocklist_mode" not in doc
+    with pytest.raises(ValidationError):
+        RateLimitConfig.model_validate({**doc, "blocklist_mode": "enforce_403"})
 
 
 @pytest.mark.parametrize("mode", ["off", "shadow"])
@@ -64,7 +67,7 @@ def test_env_accepts_off_and_shadow(mode):
 def test_env_defaults_hardcode_no_capacity():
     defaults = Settings().rate_limit_defaults
     assert defaults.global_concurrency is None and defaults.global_paid_reserve == 0
-    assert defaults.mode == "off" and defaults.blocklist_mode == "log_only"
+    assert defaults.mode == "off"
 
 
 @pytest.mark.parametrize("bad", [

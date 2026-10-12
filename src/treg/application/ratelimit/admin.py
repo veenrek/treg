@@ -95,11 +95,15 @@ async def write(db: AsyncSession, raw: object, *, actor: str, note: str,
 
 
 async def revert_to_shadow(db: AsyncSession, *, actor: str, note: str = "") -> dict:
-    """The one-click way back: the current thresholds, never refusing a request."""
+    """The one-click way back: the current thresholds in shadow, and the blocklist in log_only."""
     latest = await _latest(db)
     base = (RateLimitConfig.model_validate(latest.config) if latest
             else get_settings().rate_limit_defaults)
     config = base.model_copy(update={"mode": "shadow"})
+    # The blocklist goes back to log_only in the same transaction (its mode lives on its own row).
+    from .blocklist_admin import record_mode
+    await record_mode(db, "log_only", actor=actor, approved_by=actor, reason=note or "revert to shadow",
+                      now=utcnow_naive())
     return await _insert(db, config, actor=actor, action="revert_to_shadow",
                          note=note or "revert to shadow", enforce_approval=None, base_version=None)
 

@@ -52,7 +52,15 @@ def _fresh():
     get_settings.cache_clear()
 
 
+_blocklist_mode = ["log_only"]
+
+
 def use(**update) -> RateLimitConfig:
+    """The policy, as the config refresh would set it; `blocklist_mode` goes to the blocklist row."""
+    _blocklist_mode[0] = update.pop("blocklist_mode", "log_only")
+    held = blocklist_state.current()
+    if held is not None:
+        install_blocklist(version=held.version, mode=_blocklist_mode[0])
     doc = get_settings().rate_limit_defaults.model_dump(mode="json")
     doc.update(update)
     cfg = RateLimitConfig.model_validate(doc)
@@ -63,7 +71,7 @@ def use(**update) -> RateLimitConfig:
 
 
 async def _load_blocklist(monkeypatch, *entries, version: int = 5):
-    return install_blocklist(*entries, version=version)
+    return install_blocklist(*entries, version=version, mode=_blocklist_mode[0])
 
 
 def _token(client) -> str:
@@ -127,8 +135,7 @@ async def test_a_cached_org_is_refused_before_auth(clients, monkeypatch):
 
 
 async def test_log_only_matches_and_logs_but_serves(clients, monkeypatch, caplog):
-    use()  # the env default: log_only
-    assert config_state.current().config.blocklist_mode == "log_only"
+    use()  # the version row's default: log_only
     caller = await _learn(clients)
     await _load_blocklist(monkeypatch, ("org_id", str(caller.org_id), 3600))
     caplog.set_level(logging.INFO, logger="treg.ratelimit")
@@ -292,7 +299,7 @@ async def test_signals_flush_on_their_own_pool_with_org_age_and_net_paid(clients
     real = signals_flush.ratelimit_session_maker
     monkeypatch.setattr(signals_flush, "ratelimit_session_maker", lambda: (opened.append("ratelimit"), real())[1])
     assert await signals_flush.flush() == 3
-    assert opened == ["ratelimit"]
+    assert opened == ["ratelimit", "ratelimit"]  # the insert, then the prune in its own transaction
     async with session_maker() as db:
         rows = (await db.execute(select(SurgeSignal))).scalars().all()
     org = next(r for r in rows if r.scope == "org")
@@ -324,3 +331,40 @@ async def test_an_uncached_key_is_counted_but_never_refused_by_the_ceiling(clien
     assert any(r["tier"] == "unknown" and r["result"] == "shadow_reject" and r["mode"] == "enforce"
                for r in rows)
     assert (await clients.get("/tools")).status_code == 429  # known now, and unpaid
+
+
+
+async def test_a_failing_prune_never_drops_the_insert_and_is_not_retried_every_minute(clients, monkeypatch):
+    use(mode="off")
+    await clients.get("/tools")
+    calls: list[str] = []
+    real = signals_flush.ratelimit_session_maker
+
+    class FailingPrune:
+        def __init__(self):
+            self.inner = real()
+
+        async def __aenter__(self):
+            db = await self.inner.__aenter__()
+            original = db.execute
+
+            async def execute(statement, *a, **k):
+                if "DELETE" in str(statement).upper():
+                    calls.append("delete")
+                    raise TimeoutError("statement timeout")
+                return await original(statement, *a, **k)
+
+            db.execute = execute
+            return db
+
+        async def __aexit__(self, *a):
+            return await self.inner.__aexit__(*a)
+
+    monkeypatch.setattr(signals_flush, "ratelimit_session_maker", FailingPrune)
+    written = await signals_flush.flush()
+    assert written > 0 and calls == ["delete"]
+    async with session_maker() as db:
+        assert len((await db.execute(select(SurgeSignal))).scalars().all()) == written  # insert kept
+    await clients.get("/tools")
+    assert await signals_flush.flush() > 0
+    assert calls == ["delete"]  # the failed prune is not retried until an hour has passed

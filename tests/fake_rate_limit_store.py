@@ -86,7 +86,7 @@ def install(monkeypatch) -> FakeRateLimitStore:
     return store
 
 
-def install_blocklist(*entries, version: int = 5):
+def install_blocklist(*entries, version: int = 5, mode: str = "log_only"):
     """Put a blocklist in the process cache the way `blocklist_sync` does after a Postgres load.
     `entries` are (type, value, expires_in_seconds)."""
     import time
@@ -97,6 +97,6 @@ def install_blocklist(*entries, version: int = 5):
     now = time.time()
     bl = Blocklist.build(version, "2026-01-01T00:00:00Z", tuple(
         BlockEntry(kind, value, "flood from one IP", now + expires_in, "ops")
-        for kind, value, expires_in in entries))
+        for kind, value, expires_in in entries), mode=mode)
     blocklist_state.install(bl)
     return bl

@@ -14,10 +14,9 @@ from sqlalchemy import event
 
 import treg.__main__ as treg_main
 from treg.api import app
-from treg.application.ratelimit import blocklist_state, config_state, limiter
+from treg.application.ratelimit import blocklist_state, limiter
 from treg.bootstrap_ratelimit import RateLimitMiddleware
 from treg.config import get_settings
-from treg.domain.ratelimit import RateLimitConfig
 from treg.infra import db as infra_db
 from treg.infra import kv, request_scope
 from tests.fake_rate_limit_store import install, install_blocklist
@@ -33,13 +32,12 @@ def _fresh():
 
 
 def _enforce_blocklist() -> None:
-    doc = get_settings().rate_limit_defaults.model_dump(mode="json")
-    doc["blocklist_mode"] = "enforce_403"
-    config_state._swap(config_state.ConfigState(RateLimitConfig.model_validate(doc), 7, "store", False))
+    """The blocklist's mode lives on its version row; this is what a poll of `enforce_403` loads."""
+    install_blocklist(version=1, mode="enforce_403")
 
 
 async def _block_org(monkeypatch, org_id: int) -> None:
-    install_blocklist(("org_id", str(org_id), 3600), version=3)
+    install_blocklist(("org_id", str(org_id), 3600), version=3, mode="enforce_403")
 
 
 @contextmanager
@@ -119,7 +117,7 @@ async def test_unblocking_takes_effect_without_waiting_for_the_key_cache(clients
     org_id = await _org_of(clients)
     await _block_org(monkeypatch, org_id)
     assert (await clients.get("/tools")).status_code == 403
-    install_blocklist(version=4)  # what the poll loads after an unblock: a newer list without the org
+    install_blocklist(version=4, mode="enforce_403")  # what the poll loads after an unblock: a newer list without the org
     assert (await clients.get("/tools")).status_code == 200
 
 
@@ -276,7 +274,7 @@ async def test_the_blocklist_403_never_reveals_the_operators_reason(clients, mon
     secret_reason = "matched signup burst rule 7 from the surge query"
     blocklist_state.install(Blocklist.build(3, "2026-01-01T00:00:00Z", (BlockEntry(
         "key_hash", crypto.hash_token(clients.headers["X-Treg-Token"]), secret_reason,
-        time.time() + 3600, "ops"),)))
+        time.time() + 3600, "ops"),), mode="enforce_403"))
     r = await clients.get("/tools")
     assert r.status_code == 403
     assert r.json() == {"detail": {"error": "blocked", "reason": "treg_blocklist.key_hash",

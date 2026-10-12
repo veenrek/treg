@@ -1,8 +1,9 @@
-"""Writing the blocklist: one Postgres transaction per call (entries, audit row, version).
+"""Writing the blocklist: one Postgres transaction per call (entries, audit row, version + 1).
 
-The only writer of `BlocklistEntry`, `BlocklistAudit` and `BlocklistVersion`. Every change inserts
-one audit row and sets the single version row to that audit id in the same transaction; serving
-processes poll the version and reload (`blocklist_sync`). There is no other copy to publish. The
+The only writer of `BlocklistEntry`, `BlocklistAudit` and `BlocklistVersion`. Every change (a block,
+an unblock, a mode change) runs `version = version + 1` on the single pre-inserted version row and
+inserts one audit row carrying that version, in one transaction; serving processes poll the
+version and reload (`blocklist_sync`). There is no other copy to publish. The
 caller (an operator bot) reads the version back and treats an entry as live only once `status`
 shows every serving process on it. After each write the server posts a receipt (`receipts`),
 best-effort and never part of the write. Interim: the write API is expected to move.
@@ -51,9 +52,10 @@ def _entry_out(e: BlocklistEntry) -> dict:
             "revoke_reason": e.revoke_reason}
 
 
-async def _version(db: AsyncSession) -> int:
-    row = await db.get(BlocklistVersion, 1)
-    return row.version if row else 0
+async def _head(db: AsyncSession) -> tuple[int, str]:
+    row = (await db.execute(select(BlocklistVersion.version, BlocklistVersion.mode)
+                            .where(BlocklistVersion.id == 1))).first()
+    return (int(row[0]), row[1]) if row else (0, "log_only")
 
 
 async def _active(db: AsyncSession, now: datetime) -> list[BlocklistEntry]:
@@ -63,13 +65,20 @@ async def _active(db: AsyncSession, now: datetime) -> list[BlocklistEntry]:
     )).scalars().all())
 
 
-async def _bump_version(db: AsyncSession, version: int, now: datetime) -> None:
-    """Never lower: a conditional UPDATE, so two writes committing out of order keep the higher
-    version. The row is created by the first write ever."""
-    moved = await db.execute(update(BlocklistVersion).where(
-        BlocklistVersion.id == 1, BlocklistVersion.version < version).values(version=version, updated_at=now))
-    if moved.rowcount == 0 and await db.get(BlocklistVersion, 1) is None:
-        db.add(BlocklistVersion(id=1, version=version, updated_at=now))
+async def advance(db: AsyncSession, now: datetime, *, mode: str | None = None) -> int:
+    """`version = version + 1` (and the mode, when given) on the single row, in the caller's
+    transaction. The row lock serializes concurrent writers; the returned value is the version."""
+    values: dict = {"version": BlocklistVersion.version + 1, "updated_at": now}
+    if mode is not None:
+        values["mode"] = mode
+    row = (await db.execute(update(BlocklistVersion).where(BlocklistVersion.id == 1)
+                            .values(**values).returning(BlocklistVersion.version))).first()
+    if row is None:
+        raise RuntimeError("the blocklistversion row is missing (migration 0070 inserts it)")
+    return int(row[0])
+
+
+MODES = ("off", "log_only", "enforce_403")
 
 
 def _required(name: str, value: object, errors: list[str], *, limit: int = 500) -> str:
@@ -168,18 +177,18 @@ async def block(db: AsyncSession, *, actor: str, entries: list[dict], reason: st
                            expires_at=now + timedelta(seconds=ttl)) for kind, value in targets]
     db.add_all(rows)
     await db.flush()
-    audit = BlocklistAudit(entry_ids=[r.id for r in rows], action="block", actor=actor,
+    version = await advance(db, now)
+    audit = BlocklistAudit(entry_ids=[r.id for r in rows], version=version, action="block", actor=actor,
                            approved_by=approved_by, reason=reason, evidence=evidence, ttl_s=ttl,
                            created_at=now)
     db.add(audit)
     await db.flush()
     out = [_entry_out(r) for r in rows]
     audit_id = audit.id
-    await _bump_version(db, audit_id, now)
-    await db.commit()  # entries, audit and version in one transaction
-    log.info("rate_limit_blocklist_written action=block audit=%s entries=%s actor=%s",
-             audit_id, len(rows), actor)
-    result = {"entries": out, "audit_id": audit_id, "version": audit_id, "ttl_s": ttl}
+    await db.commit()  # entries, audit and version+1 in one transaction
+    log.info("rate_limit_blocklist_written action=block audit=%s version=%s entries=%s actor=%s",
+             audit_id, version, len(rows), actor)
+    result = {"entries": out, "audit_id": audit_id, "version": version, "ttl_s": ttl}
     receipts.send("block", result)
     return result
 
@@ -197,22 +206,50 @@ async def unblock(db: AsyncSession, entry_id: int, *, actor: str, approved_by: s
     now = utcnow_naive()
     if entry.revoked_at is None:
         entry.revoked_at, entry.revoked_by, entry.revoke_reason = now, actor, reason
-    audit = BlocklistAudit(entry_ids=[entry.id], action="unblock", actor=actor, approved_by=approved_by,
-                           reason=reason, evidence={}, created_at=now)
+    version = await advance(db, now)
+    audit = BlocklistAudit(entry_ids=[entry.id], version=version, action="unblock", actor=actor,
+                           approved_by=approved_by, reason=reason, evidence={}, created_at=now)
     db.add(audit)
     await db.flush()
     out, audit_id = _entry_out(entry), audit.id
-    await _bump_version(db, audit_id, now)
     await db.commit()
-    log.info("rate_limit_blocklist_written action=unblock audit=%s entry=%s actor=%s", audit_id, entry_id, actor)
-    result = {"entries": [out], "audit_id": audit_id, "version": audit_id}
+    log.info("rate_limit_blocklist_written action=unblock audit=%s version=%s entry=%s actor=%s",
+             audit_id, version, entry_id, actor)
+    result = {"entries": [out], "audit_id": audit_id, "version": version}
     receipts.send("unblock", result)
     return result
 
 
+async def record_mode(db: AsyncSession, mode: str, *, actor: str, approved_by: str, reason: str,
+                      now: datetime) -> tuple[int, int]:
+    """Set the mode and bump the version in the caller's transaction, with its audit row.
+    Returns (version, audit id). The caller commits."""
+    version = await advance(db, now, mode=mode)
+    audit = BlocklistAudit(entry_ids=[], version=version, action="mode", actor=actor,
+                           approved_by=approved_by, reason=reason, evidence={"mode": mode}, created_at=now)
+    db.add(audit)
+    await db.flush()
+    return version, audit.id
+
+
+async def set_mode(db: AsyncSession, mode: str, *, actor: str, approved_by: str, reason: str) -> dict:
+    errors: list[str] = []
+    reason = _required("reason", reason, errors)
+    approved_by = _required("approved_by", approved_by, errors, limit=200)
+    if mode not in MODES:
+        errors.append(f"mode: one of {', '.join(MODES)}")
+    if errors:
+        raise Rejected(errors)
+    version, audit_id = await record_mode(db, mode, actor=actor, approved_by=approved_by,
+                                          reason=reason, now=utcnow_naive())
+    await db.commit()
+    log.info("rate_limit_blocklist_written action=mode mode=%s version=%s actor=%s", mode, version, actor)
+    return {"mode": mode, "version": version, "audit_id": audit_id}
+
+
 async def listing(db: AsyncSession) -> dict:
     now = utcnow_naive()
-    version = await _version(db)
+    version, mode = await _head(db)
     entries = [_entry_out(e) for e in await _active(db, now)]
     await db.commit()
-    return {"version": version, "entries": entries}
+    return {"version": version, "mode": mode, "entries": entries}

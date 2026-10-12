@@ -2628,6 +2628,14 @@
   {
     "kind": "APIRoute",
     "methods": [
+      "POST"
+    ],
+    "name": "admin_blocklist_mode",
+    "path": "/admin/blocklist/mode"
+  },
+  {
+    "kind": "APIRoute",
+    "methods": [
       "GET",
       "HEAD"
     ],

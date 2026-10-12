@@ -122,7 +122,7 @@ def _swap(new: ConfigState) -> None:
             new.version, new.source, new.fallback, new.degraded, new.config.mode):
         log.info("rate_limit_config_changed %s", json.dumps({
             "event": "rate_limit_config_changed", "version": new.version, "source": new.source,
-            "mode": new.config.mode, "blocklist_mode": new.config.blocklist_mode,
+            "mode": new.config.mode,
             "previous_version": old.version if old else None, "fallback": new.fallback,
             "degraded": new.degraded,
         }, separators=(",", ":")))

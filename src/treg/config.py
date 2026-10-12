@@ -112,7 +112,6 @@ def _rate_limit_defaults(s: "Settings"):
 
     return RateLimitConfig.model_validate({
         "mode": s.rate_limit_mode,
-        "blocklist_mode": s.rate_limit_blocklist_mode,
         "global_concurrency": s.rate_limit_global_concurrency,
         "global_paid_reserve": s.rate_limit_global_paid_reserve,
         "concurrency_ttl_s": s.rate_limit_concurrency_ttl_s or (s.call_timeout_s + s.hold_grace_s),
@@ -149,12 +148,11 @@ class Settings(BaseSettings):
     # ---- request admission (application/ratelimit, docs/context/architecture/rate-limit.md) ----
     # The policy fields below are DEFAULTS: a process uses them until it has read a valid
     # `rl:config` from the shared store, which an admin writes through /admin/rate-limit/config
-    # without a redeploy. Refusing requests (`enforce`, `enforce_403`) is refused here on purpose:
-    # it needs an audited admin write. An unset global ceiling is measured and refuses nothing; its
+    # without a redeploy. `enforce` is refused here on purpose: it needs an audited admin write.
+    # The blocklist's mode is not here: it lives on the `blocklistversion` row. An unset global ceiling is measured and refuses nothing; its
     # figure comes from measured peak in-flight concurrency and p95 latency, never from this file.
     # Off until the shared store's latency on the request path is measured; then shadow.
     rate_limit_mode: str = "off"
-    rate_limit_blocklist_mode: str = "log_only"
     rate_limit_global_concurrency: int | None = None
     rate_limit_global_paid_reserve: int = 0
     # Must outlast the longest request; empty = call_timeout_s + hold_grace_s.
@@ -166,12 +164,18 @@ class Settings(BaseSettings):
     rate_limit_config_max_age_s: float = Field(default=1800.0, ge=60, le=86_400)
     # Each worker polls the single-row blocklist version this often, reloading entries on a change.
     rate_limit_blocklist_refresh_s: float = Field(default=10.0, ge=10, le=300)
-    # At startup the first blocklist load is retried this long before the app reports ready;
-    # after that the process fails open and keeps retrying in the background.
-    rate_limit_blocklist_cold_start_s: float = Field(default=30.0, ge=0, le=120)
-    # statement_timeout on the dedicated `ratelimit` pool (Postgres only).
+    # At startup each worker makes ONE blocklist load attempt capped at this long, then serves:
+    # loaded if it succeeded, otherwise failing open with background retries.
+    rate_limit_blocklist_first_load_s: float = Field(default=5.0, ge=0.1, le=60)
+    # Every poll (version read and any reload) is abandoned past this.
+    rate_limit_blocklist_poll_timeout_s: float = Field(default=3.0, ge=0.1, le=60)
+    # A reload returning more active entries than this is refused whole (never truncated): the
+    # last good list stays and the process alerts. Generous on purpose.
+    rate_limit_blocklist_max_entries: int = Field(default=50_000, ge=1, le=10_000_000)
+    # statement_timeout and connect timeout on the dedicated `ratelimit` pool (Postgres only).
     rate_limit_db_statement_timeout_ms: int = Field(default=2000, ge=100, le=30_000)
-    # A missing `rl:config` / `rl:blocklist` is restored from Postgres at most this often, fleet-wide.
+    rate_limit_db_connect_timeout_s: float = Field(default=2.0, ge=0.1, le=30)
+    # A missing `rl:config` is restored from Postgres at most this often, fleet-wide.
     rate_limit_republish_interval_s: int = Field(default=60, ge=60, le=3600)
     rate_limit_key_cache_ttl_s: float = Field(default=60.0, ge=1, le=3600)
     rate_limit_key_cache_size: int = Field(default=10_000, ge=100, le=1_000_000)
@@ -225,14 +229,6 @@ class Settings(BaseSettings):
         if v not in ("off", "shadow"):
             raise ValueError("rate_limit_mode from the environment must be off or shadow; "
                              "enforce is set only through the audited admin endpoint")
-        return v
-
-    @field_validator("rate_limit_blocklist_mode")
-    @classmethod
-    def _blocklist_env_mode(cls, v: str) -> str:
-        if v not in ("off", "log_only"):
-            raise ValueError("rate_limit_blocklist_mode from the environment must be off or log_only; "
-                             "enforce_403 is set only through the audited admin endpoint")
         return v
 
     @model_validator(mode="after")

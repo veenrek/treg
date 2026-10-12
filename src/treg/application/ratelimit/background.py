@@ -39,7 +39,8 @@ def process_status() -> dict:
     age = config_state.age_s()
     return {
         "process_instance": PROCESS_INSTANCE, "mode": state.config.mode,
-        "blocklist_mode": state.config.blocklist_mode, "config_version": state.version,
+        "blocklist_mode": blocklist_state.current().mode if blocklist_state.current() else None,
+        "config_version": state.version,
         "config_source": state.source, "config_fallback": state.fallback,
         "config_degraded": state.degraded, "config_age_s": None if age is None else round(age),
         **blocklist_state.status(now=time.time()),
@@ -128,8 +129,20 @@ async def config_loop() -> None:
     await _forever(get_settings().rate_limit_config_refresh_s, config_step)
 
 
+_EMPTY_RETRY_S = 2.0
+
+
 async def blocklist_loop() -> None:
-    await _forever(get_settings().rate_limit_blocklist_refresh_s, blocklist_step)
+    """Every refresh interval, or every couple of seconds while no list has loaded yet."""
+    while True:
+        try:
+            await blocklist_step()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the limiter keeps its last good list
+            log.exception("rate limit blocklist pass failed")
+        loaded = blocklist_state.current() is not None
+        await asyncio.sleep(get_settings().rate_limit_blocklist_refresh_s if loaded else _EMPTY_RETRY_S)
 
 
 async def maintenance_loop() -> None:

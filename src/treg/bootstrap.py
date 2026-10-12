@@ -366,6 +366,7 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/admin/blocklist/status', ('GET',), 'admin_blocklist_status'),
     ('/admin/blocklist', ('POST',), 'admin_blocklist_block'),
     ('/admin/blocklist/{entry_id}/unblock', ('POST',), 'admin_blocklist_unblock'),
+    ('/admin/blocklist/mode', ('POST',), 'admin_blocklist_mode'),
     ('/admin/users/{user_id}/superadmin', ('POST',), 'admin_set_superadmin'),
     ('/admin/users/{user_id}/suspend', ('POST',), 'admin_suspend_user'),
     ('/admin/users/{user_id}', ('DELETE',), 'admin_delete_user'),
@@ -698,10 +699,10 @@ def _lifespan(role: AppRole):
                 else None
             )
             gauge_task = asyncio.create_task(pool_gauge()) if analytics.enabled() else None
-            # Every role serves HTTP behind the limiter, so every role refreshes its policy. The
-            # first blocklist load is retried (bounded) before the app reports ready; past that it
-            # fails open and the background loop keeps trying.
-            await rate_limit_blocklist_sync.cold_start()
+            # Every role serves HTTP behind the limiter, so every role refreshes its policy. One
+            # capped first blocklist load; on failure the worker serves anyway (fail open) and the
+            # background loop retries. Health never waits on it.
+            await rate_limit_blocklist_sync.first_load()
             rate_limit_task = asyncio.create_task(rate_limit_background.run())
             # Local transaction diagnostics run even when the analytics transport is disabled.
             trace_runner = start_money_trace(role=role)

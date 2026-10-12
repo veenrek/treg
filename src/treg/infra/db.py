@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 import os
 from collections.abc import AsyncIterator
 from functools import cache
@@ -67,8 +68,8 @@ POOL_SPECS: dict[str, dict[str, int]] = {
     "admin":      {"pool_size": 3, "max_overflow": 0},
     "background": {"pool_size": sum(BACKGROUND_CONSUMERS.values()), "max_overflow": 0},
     "read":       {"pool_size": 2, "max_overflow": 0},  # optional replica, a separate DB budget
-    # The rate limiter's background work, one task at a time: the surge-signal flush and the
-    # republish of an evicted `rl:config` / `rl:blocklist`. Never the request pool.
+    # The rate limiter's background work, one task at a time: the blocklist version poll, the
+    # surge-signal flush and the restore of an evicted `rl:config`. Never the request pool.
     "ratelimit":  {"pool_size": 1, "max_overflow": 0},
 }
 
@@ -159,8 +160,11 @@ def _new_engine(name: str, url: str | None = None):
         )
     if name == "ratelimit" and not is_sqlite:
         # Background polls and flushes only: a slow statement is abandoned, never waited on.
-        timeout = str(get_settings().rate_limit_db_statement_timeout_ms)
-        kwargs["connect_args"] = {"server_settings": {"statement_timeout": timeout}}
+        s = get_settings()
+        kwargs["connect_args"] = {
+            "server_settings": {"statement_timeout": str(s.rate_limit_db_statement_timeout_ms)},
+            "timeout": s.rate_limit_db_connect_timeout_s,  # asyncpg's connect timeout
+        }
     if name == "read" and not is_sqlite:
         # A guard against accidental writes, including when the URL points at a writable server.
         # Use a replica/read-only database role as the access boundary, not this session default.
@@ -415,6 +419,14 @@ async def reset_db() -> None:
             _built_schema = await _schema_fingerprint(connection)
 
         await _stamp_test_schema(connection)
+        await _seed_rows(connection)
+
+
+async def _seed_rows(connection) -> None:
+    """Rows a migration inserts, which `create_all` and the per-test delete do not."""
+    from ..models import BlocklistVersion
+    await connection.execute(BlocklistVersion.__table__.insert().values(
+        id=1, version=0, mode="log_only", updated_at=datetime.now(timezone.utc).replace(tzinfo=None)))
 
 
 async def dispose_engine() -> None:

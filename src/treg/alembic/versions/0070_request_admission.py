@@ -6,11 +6,13 @@ Create Date: 2026-10-12
 
 Five new tables (docs/context/architecture/rate-limit.md): `ratelimitconfigversion` (one audited
 row per policy write), `blocklistentry`, `blocklistaudit` and the single-row `blocklistversion`
-(the blocklist itself; processes poll the version and cache the entries), and `surgesignal`
+(the blocklist itself; processes poll the version and mode row, pre-inserted here, and cache the
+entries), and `surgesignal`
 (record-only per-minute request aggregates). Additive only: new tables, no change to an existing table.
 Follows 0069 (platform key slots), which lands first.
 """
 from collections.abc import Sequence
+from datetime import datetime, timezone
 
 import sqlalchemy as sa
 from alembic import op
@@ -56,6 +58,7 @@ def upgrade() -> None:
         "blocklistaudit",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("entry_ids", sa.JSON(), nullable=False),
+        sa.Column("version", sa.Integer(), nullable=False),
         sa.Column("action", sa.String(), nullable=False),
         sa.Column("actor", sa.String(), nullable=False),
         sa.Column("approved_by", sa.String(), nullable=False),
@@ -64,12 +67,16 @@ def upgrade() -> None:
         sa.Column("ttl_s", sa.Integer(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
     )
-    op.create_table(
+    version = op.create_table(
         "blocklistversion",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=False),
         sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column("mode", sa.String(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
     )
+    # The single row every write increments; present from the start, so no write ever inserts it.
+    op.bulk_insert(version, [{"id": 1, "version": 0, "mode": "log_only",
+                              "updated_at": datetime.now(timezone.utc).replace(tzinfo=None)}])
     op.create_table(
         "surgesignal",
         sa.Column("id", sa.Integer(), primary_key=True),

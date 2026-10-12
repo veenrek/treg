@@ -31,5 +31,5 @@ def test_the_request_admission_revision_only_creates_new_tables():
              and isinstance(n.func.value, ast.Name) and n.func.value.id == "op"]
     created = {c.args[0].value for c in calls if c.func.attr == "create_table"}
     assert created == {"ratelimitconfigversion", "blocklistentry", "blocklistaudit", "blocklistversion", "surgesignal"}
-    assert {c.func.attr for c in calls} <= {"create_table", "create_index"}
+    assert {c.func.attr for c in calls} <= {"create_table", "create_index", "bulk_insert"}
     assert all(c.args[1].value in created for c in calls if c.func.attr == "create_index")

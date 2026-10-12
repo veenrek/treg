@@ -5,8 +5,8 @@ Pure rules, no I/O. Batch 1 of the design (docs/context/architecture/rate-limit.
 - The **global concurrency ceiling** is the only counting layer. It is evaluated after every other
   check, and `global_paid_reserve` of its slots are usable by paid orgs only, so unpaid traffic is
   shed first. Its mode is `off`, `shadow` or `enforce`.
-- The **blocklist** refuses a key hash before auth and an org id after auth. Its entries come from
-  Postgres (`application.ratelimit.blocklist_sync`); its mode is `off`, `log_only` or `enforce_403`.
+- The **blocklist** refuses a key hash before auth and an org id after auth. Its entries and its
+  mode (`off`, `log_only` or `enforce_403`) come from Postgres (`application.ratelimit.blocklist_sync`).
 """
 
 from __future__ import annotations
@@ -44,7 +44,6 @@ class RateLimitConfig(_Strict):
     env defaults are the only place a default value comes from."""
 
     mode: Mode
-    blocklist_mode: BlocklistMode
     # None = measured, never refused. Set from measured peak in-flight concurrency, not a guess.
     global_concurrency: int | None = Field(ge=1, le=MAX_GLOBAL_CONCURRENCY)
     global_paid_reserve: int = Field(ge=0, le=MAX_GLOBAL_CONCURRENCY)
@@ -163,16 +162,18 @@ class Blocklist:
     version: int
     updated_at: str
     entries: tuple[BlockEntry, ...]
+    mode: BlocklistMode = "log_only"
     _index: dict[tuple[str, str], BlockEntry] = field(default_factory=dict, compare=False, repr=False)
 
     @classmethod
-    def build(cls, version: int, updated_at: str, entries: tuple[BlockEntry, ...]) -> Blocklist:
+    def build(cls, version: int, updated_at: str, entries: tuple[BlockEntry, ...],
+              mode: BlocklistMode = "log_only") -> Blocklist:
         index: dict[tuple[str, str], BlockEntry] = {}
         for e in entries:
             held = index.get((e.kind, e.value))
             if held is None or e.expires_at > held.expires_at:
                 index[(e.kind, e.value)] = e
-        return cls(version, updated_at, entries, index)
+        return cls(version, updated_at, entries, mode, index)
 
     def match(self, kind: MatchType, value: str, *, now: float) -> BlockEntry | None:
         entry = self._index.get((kind, value))
