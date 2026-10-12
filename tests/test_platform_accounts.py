@@ -314,3 +314,13 @@ async def test_concurrency_places_are_per_account_and_a_full_one_is_avoided(
         other_team.release()
         fair_share.reset()
     assert seen == [f"Bearer {TIKHUB_B}"] * 3
+
+
+def test_every_process_does_not_start_its_rotation_on_the_primary(two_tikhub_accounts):
+    """Each web worker's first call on a provider: with every counter starting at 0, all of them
+    went to the primary and low traffic across several workers never reached account b."""
+    firsts = set()
+    for _ in range(40):
+        keyslots._rotation.clear()  # a fresh process
+        firsts.add(_assigned())
+    assert firsts == {PRIMARY_SLOT, "b"}
